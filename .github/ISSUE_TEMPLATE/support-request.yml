@@ -1,0 +1,89 @@
+name: Support Request
+description: Report a bug or request help. Please read the PrismCast documentation before creating a support request.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### Before opening a support request, please ensure you have read the [documentation](https://github.com/hjdhjd/prismcast#readme). ***Questions and topics already addressed in the documentation, or in prior issue reports, will be closed without a response.***
+
+  - type: input
+    id: prismcast-version
+    attributes:
+      label: PrismCast Version
+      description: Which version of PrismCast are you running? (Run `prismcast --version` to check)
+      placeholder: e.g. v1.0.0
+    validations:
+      required: true
+
+  - type: input
+    id: platform-os
+    attributes:
+      label: Platform and OS
+      description: What hardware and operating system are you running PrismCast on?
+      placeholder: e.g. macOS Sequoia 15.2, Ubuntu 24.04, Windows 11
+    validations:
+      required: true
+
+  - type: input
+    id: node
+    attributes:
+      label: Node Version
+      description: Which version of Node are you running? (Run `node --version` to check)
+      placeholder: e.g. v22.0.0
+    validations:
+      required: true
+
+  - type: input
+    id: chrome
+    attributes:
+      label: Chrome Version
+      description: Which version of Google Chrome are you using? (Check chrome://version or About Google Chrome)
+      placeholder: e.g. 131.0.6778.86
+    validations:
+      required: true
+
+  - type: input
+    id: channel
+    attributes:
+      label: Affected Channel (if applicable)
+      description: If this issue relates to a specific channel, which one?
+      placeholder: e.g. NBC, CNN, or a custom channel URL
+    validations:
+      required: false
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: Describe the problem
+      description: Please describe the issue you're encountering, including steps to reproduce.
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: PrismCast Configuration
+      description: Please copy and paste your PrismCast configuration from `~/.prismcast/config.json`. Ensure that you redact any sensitive information. This will be automatically formatted into code, so no need for backticks.
+      placeholder: Paste your config.json contents here. If you haven't customized any settings, you can write "Default configuration" instead.
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: PrismCast Log Output
+      description: Please copy and paste relevant log output from PrismCast. Include startup logs and any error messages. You can view logs in the web UI at `http://localhost:5589/#logs` or in `~/.prismcast/prismcast.log`. This will be automatically formatted into code, so no need for backticks.
+      placeholder: Paste relevant log entries here. Include the full startup sequence if possible.
+      render: shell
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: acknowledgment
+    attributes:
+      label: Acknowledgment
+      description: By submitting this issue, you acknowledge the following.
+      options:
+        - label: I have read the documentation and searched existing issues before creating this support request.
+          required: true

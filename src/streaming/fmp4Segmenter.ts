@@ -1,0 +1,354 @@
+/* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
+ * fmp4Segmenter.ts: fMP4 HLS segmentation for PrismCast.
+ */
+import { storeInitSegment, storeSegment, updatePlaylist } from "./hlsSegments.js";
+import { CONFIG } from "../config/index.js";
+import type { MP4Box } from "./mp4Parser.js";
+import type { Readable } from "node:stream";
+import { createMP4BoxParser } from "./mp4Parser.js";
+
+/*
+ * FMP4 SEGMENTATION
+ *
+ * This module transforms a puppeteer-stream MP4 capture into HLS fMP4 segments. It replaces FFmpeg by performing native MP4 parsing and segmentation. The overall flow
+ * is:
+ *
+ * 1. Receive MP4 data from puppeteer-stream (already fragmented MP4 with H.264 + AAC)
+ * 2. Parse MP4 box structure to identify:
+ *    - ftyp + moov: Initialization segment (codec configuration)
+ *    - moof + mdat pairs: Media fragments
+ * 3. Store init segment and accumulate media fragments into segments
+ * 4. Generate and update the m3u8 playlist
+ *
+ * The key advantage over FFmpeg is eliminating an external process dependency while achieving the same result: zero-transcoding HLS output.
+ */
+
+// ─────────────────────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Options for creating an fMP4 segmenter.
+ */
+export interface FMP4SegmenterOptions {
+
+  // Callback when the segmenter encounters an error.
+  onError: (error: Error) => void;
+
+  // Callback when the segmenter stops (stream ended or error).
+  onStop: () => void;
+
+  // If true, the first segment from this segmenter should have a discontinuity marker. Used after tab replacement to signal codec/timing change.
+  pendingDiscontinuity?: boolean;
+
+  // Starting segment index for continuation after tab replacement. If not provided, starts at 0.
+  startingSegmentIndex?: number;
+
+  // The numeric stream ID for storage.
+  streamId: number;
+}
+
+/**
+ * Result of creating an fMP4 segmenter.
+ */
+export interface FMP4SegmenterResult {
+
+  // Get the current segment index. Used by tab replacement to continue numbering from where the old segmenter left off.
+  getSegmentIndex: () => number;
+
+  // Pipe a readable stream to the segmenter.
+  pipe: (stream: Readable) => void;
+
+  // Stop the segmenter and clean up.
+  stop: () => void;
+}
+
+/**
+ * Internal state for tracking segmentation progress.
+ */
+interface SegmenterState {
+
+  // Segment indices that should have a discontinuity marker before them in the playlist.
+  discontinuityIndices: Set<number>;
+
+  // Accumulated fragment data for the current segment.
+  fragmentBuffer: Buffer[];
+
+  // Whether we have received the complete init segment.
+  hasInit: boolean;
+
+  // Boxes collected for the init segment (ftyp + moov).
+  initBoxes: Buffer[];
+
+  // Whether the next segment should have a discontinuity marker (consumed when first segment is output).
+  pendingDiscontinuity: boolean;
+
+  // Current media segment index.
+  segmentIndex: number;
+
+  // Time when current segment started accumulating.
+  segmentStartTime: number;
+
+  // Whether the segmenter has been stopped.
+  stopped: boolean;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Segmenter Implementation
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Creates an fMP4 segmenter that transforms MP4 input into HLS segments. The segmenter parses MP4 boxes, extracts the init segment, and accumulates media fragments
+ * into segments based on the configured duration.
+ * @param options - Segmenter options including stream ID and callbacks.
+ * @returns The segmenter interface with pipe and stop methods.
+ */
+export function createFMP4Segmenter(options: FMP4SegmenterOptions): FMP4SegmenterResult {
+
+  const { onError, onStop, pendingDiscontinuity, startingSegmentIndex, streamId } = options;
+
+  // Initialize state.
+  const state: SegmenterState = {
+
+    discontinuityIndices: new Set(),
+    fragmentBuffer: [],
+    hasInit: false,
+    initBoxes: [],
+    pendingDiscontinuity: pendingDiscontinuity ?? false,
+    segmentIndex: startingSegmentIndex ?? 0,
+    segmentStartTime: Date.now(),
+    stopped: false
+  };
+
+  // Reference to the input stream for cleanup.
+  let inputStream: Readable | null = null;
+
+  /**
+   * Generates the m3u8 playlist content.
+   */
+  function generatePlaylist(): string {
+
+    const lines: string[] = [
+      "#EXTM3U",
+      "#EXT-X-VERSION:7",
+      [ "#EXT-X-TARGETDURATION:", String(Math.ceil(CONFIG.hls.segmentDuration)) ].join(""),
+      [ "#EXT-X-MEDIA-SEQUENCE:", String(Math.max(0, state.segmentIndex - CONFIG.hls.maxSegments)) ].join(""),
+      "#EXT-X-MAP:URI=\"init.mp4\""
+    ];
+
+    // Add segment entries. We only list segments that are currently in storage (based on maxSegments).
+    const startIndex = Math.max(0, state.segmentIndex - CONFIG.hls.maxSegments);
+
+    for(let i = startIndex; i < state.segmentIndex; i++) {
+
+      // Add discontinuity marker before segments that follow a tab replacement.
+      if(state.discontinuityIndices.has(i)) {
+
+        lines.push("#EXT-X-DISCONTINUITY");
+      }
+
+      lines.push([ "#EXTINF:", String(CONFIG.hls.segmentDuration.toFixed(3)), "," ].join(""));
+      lines.push([ "segment", String(i), ".m4s" ].join(""));
+    }
+
+    lines.push("");
+
+    return lines.join("\n");
+  }
+
+  /**
+   * Outputs the current fragment buffer as a segment.
+   */
+  function outputSegment(): void {
+
+    if(state.fragmentBuffer.length === 0) {
+
+      return;
+    }
+
+    // If this segment follows a tab replacement, record its index for discontinuity marking.
+    if(state.pendingDiscontinuity) {
+
+      state.discontinuityIndices.add(state.segmentIndex);
+      state.pendingDiscontinuity = false;
+    }
+
+    // Combine all fragment data into a single segment.
+    const segmentData = Buffer.concat(state.fragmentBuffer);
+    const segmentName = [ "segment", String(state.segmentIndex), ".m4s" ].join("");
+
+    // Store the segment.
+    storeSegment(streamId, segmentName, segmentData);
+
+    // Increment segment index.
+    state.segmentIndex++;
+
+    // Clear the fragment buffer.
+    state.fragmentBuffer = [];
+    state.segmentStartTime = Date.now();
+
+    // Update the playlist.
+    updatePlaylist(streamId, generatePlaylist());
+  }
+
+  /**
+   * Handles a parsed MP4 box.
+   */
+  function handleBox(box: MP4Box): void {
+
+    if(state.stopped) {
+
+      return;
+    }
+
+    // Handle init segment boxes (ftyp, moov).
+    if(!state.hasInit) {
+
+      if((box.type === "ftyp") || (box.type === "moov")) {
+
+        state.initBoxes.push(box.data);
+
+        // Check if we have both ftyp and moov.
+        if(box.type === "moov") {
+
+          // Output the init segment.
+          const initData = Buffer.concat(state.initBoxes);
+
+          storeInitSegment(streamId, initData);
+
+          state.hasInit = true;
+
+          // Debug: LOG.info("Stored init segment for stream %s (%s bytes).", streamId, initData.length);
+        }
+
+        return;
+      }
+    }
+
+    // Handle media fragment boxes (moof, mdat).
+    if(box.type === "moof") {
+
+      // Start of a new fragment. If we have accumulated enough data, output a segment first.
+      const elapsedMs = Date.now() - state.segmentStartTime;
+      const targetMs = CONFIG.hls.segmentDuration * 1000;
+
+      if((state.fragmentBuffer.length > 0) && (elapsedMs >= targetMs)) {
+
+        outputSegment();
+      }
+
+      // Add moof to the fragment buffer.
+      state.fragmentBuffer.push(box.data);
+
+      return;
+    }
+
+    if(box.type === "mdat") {
+
+      // Add mdat to the fragment buffer.
+      state.fragmentBuffer.push(box.data);
+
+      return;
+    }
+
+    // Other box types (styp, sidx, etc.) are passed through to the current segment.
+    if(state.hasInit) {
+
+      state.fragmentBuffer.push(box.data);
+    }
+  }
+
+  // Create the MP4 box parser.
+  const parser = createMP4BoxParser(handleBox);
+
+  /**
+   * Handles data from the input stream.
+   */
+  function handleData(chunk: Buffer): void {
+
+    if(state.stopped) {
+
+      return;
+    }
+
+    try {
+
+      parser.push(chunk);
+    } catch(error) {
+
+      onError(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  /**
+   * Handles the end of the input stream.
+   */
+  function handleEnd(): void {
+
+    if(state.stopped) {
+
+      return;
+    }
+
+    // Output any remaining data as a final segment.
+    if(state.fragmentBuffer.length > 0) {
+
+      outputSegment();
+    }
+
+    state.stopped = true;
+    parser.flush();
+    onStop();
+  }
+
+  /**
+   * Handles input stream errors.
+   */
+  function handleError(error: Error): void {
+
+    if(state.stopped) {
+
+      return;
+    }
+
+    state.stopped = true;
+    parser.flush();
+    onError(error);
+  }
+
+  return {
+
+    getSegmentIndex: (): number => state.segmentIndex,
+
+    pipe: (stream: Readable): void => {
+
+      inputStream = stream;
+
+      stream.on("data", handleData);
+      stream.on("end", handleEnd);
+      stream.on("error", handleError);
+    },
+
+    stop: (): void => {
+
+      if(state.stopped) {
+
+        return;
+      }
+
+      state.stopped = true;
+
+      // Remove listeners from input stream.
+      if(inputStream) {
+
+        inputStream.removeListener("data", handleData);
+        inputStream.removeListener("end", handleEnd);
+        inputStream.removeListener("error", handleError);
+      }
+
+      // Flush the parser.
+      parser.flush();
+    }
+  };
+}

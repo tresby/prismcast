@@ -1,0 +1,695 @@
+/* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
+ *
+ * setup.ts: Common stream setup logic for PrismCast.
+ */
+import type { Channel, ResolvedSiteProfile, UrlValidation } from "../types/index.js";
+import type { Frame, Page } from "puppeteer-core";
+import { LOG, formatError, registerAbortController, retryOperation, runWithStreamContext, spawnFFmpeg } from "../utils/index.js";
+import type { MonitorStreamInfo, RecoveryMetrics, TabReplacementResult } from "./monitor.js";
+import { getCurrentBrowser, getStream, minimizeBrowserWindow, registerManagedPage, unregisterManagedPage } from "../browser/index.js";
+import { getNextStreamId, getStreamCount } from "./registry.js";
+import { getProfileForChannel, getProfileForUrl, getProfiles, resolveProfile } from "../config/profiles.js";
+import { CONFIG } from "../config/index.js";
+import type { FFmpegProcess } from "../utils/index.js";
+import type { Readable } from "node:stream";
+import { getEffectiveViewport } from "../config/presets.js";
+import { monitorPlaybackHealth } from "./monitor.js";
+import { pipeline } from "node:stream/promises";
+import { resizeAndMinimizeWindow } from "../browser/cdp.js";
+import { tuneToChannel } from "../browser/video.js";
+
+/*
+ * STREAM SETUP
+ *
+ * This module contains the common stream setup logic for HLS streaming. The core logic is split into two functions:
+ *
+ * 1. createPageWithCapture(): Creates a browser page, starts media capture, navigates to the URL, and sets up video playback. This is the reusable core that both
+ *    initial stream setup and tab replacement recovery use.
+ *
+ * 2. setupStream(): Orchestrates stream creation by calling createPageWithCapture(), then registering the stream and starting the health monitor. This is the
+ *    entry point for new stream requests.
+ *
+ * The separation allows tab replacement recovery (in monitor.ts) to reuse the capture setup logic without duplicating code. When a browser tab becomes unresponsive,
+ * the recovery handler can close the old tab, call createPageWithCapture() to create a fresh one, and continue with the same stream ID.
+ *
+ * createPageWithCapture() handles:
+ * - Browser page creation with CSP bypass
+ * - Media stream initialization (native fMP4 or WebM+FFmpeg)
+ * - Navigation with retry
+ * - Video element detection and playback setup
+ *
+ * setupStream() additionally handles:
+ * - Request validation (URL format, concurrent stream limit)
+ * - Stream registration
+ * - Health monitor startup
+ * - Cleanup function creation
+ */
+
+// Native fMP4 capture uses MP4/AAC for direct HLS segmentation without transcoding.
+const NATIVE_FMP4_MIME_TYPE = "video/mp4;codecs=avc1,mp4a.40.2";
+
+// WebM+FFmpeg capture uses WebM/H264+Opus, which requires FFmpeg to transcode audio to AAC. This mode is more stable for long recordings because Chrome's native fMP4
+// MediaRecorder can become unstable after 20-30 minutes.
+const WEBM_FFMPEG_MIME_TYPE = "video/webm;codecs=h264,opus";
+
+// ─────────────────────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Factory function type for creating tab replacement handlers. Called by setupStream after generating stream IDs and resolving the profile, allowing the caller to
+ * create a handler with access to all necessary context.
+ */
+export type TabReplacementHandlerFactory = (
+  numericStreamId: number,
+  streamId: string,
+  profile: ResolvedSiteProfile
+) => () => Promise<TabReplacementResult | null>;
+
+/**
+ * Options for setting up a stream.
+ */
+export interface StreamSetupOptions {
+
+  // The channel definition if streaming a named channel.
+  channel?: Channel;
+
+  // The channel name (key) if streaming a named channel.
+  channelName?: string;
+
+  // Whether to treat this as a static page without video.
+  noVideo?: boolean;
+
+  // Factory function to create a tab replacement handler. Called after stream IDs are generated so the handler has access to them. If not provided, tab replacement
+  // recovery is disabled.
+  onTabReplacementFactory?: TabReplacementHandlerFactory;
+
+  // Override the autodetected profile with a specific profile name.
+  profileOverride?: string;
+
+  // The URL to stream. Required.
+  url: string;
+}
+
+/**
+ * Result from setting up a stream.
+ */
+export interface StreamSetupResult {
+
+  // The puppeteer-stream capture output. For native fMP4 mode, this is the raw MP4/AAC stream. For WebM+FFmpeg mode, this is FFmpeg's fMP4 output.
+  captureStream: Readable;
+
+  // The channel display name if streaming a named channel.
+  channelName: string | null;
+
+  // Cleanup function to release all resources. Safe to call multiple times.
+  cleanup: () => Promise<void>;
+
+  // The FFmpeg process for WebM-to-fMP4 transcoding, or null if using native fMP4 mode.
+  ffmpegProcess: FFmpegProcess | null;
+
+  // Unique numeric ID for this stream.
+  numericStreamId: number;
+
+  // The browser page for this stream.
+  page: Page;
+
+  // The resolved site profile.
+  profile: ResolvedSiteProfile;
+
+  // The name of the resolved profile (e.g., "keyboardDynamic", "fullscreenApi", "default").
+  profileName: string;
+
+  // Timestamp when the stream started.
+  startTime: Date;
+
+  // Function to stop the health monitor. Returns recovery metrics for the termination summary.
+  stopMonitor: () => RecoveryMetrics;
+
+  // Unique string ID for log correlation (e.g., "nbc-abc123").
+  streamId: string;
+
+  // The URL being streamed.
+  url: string;
+}
+
+/**
+ * Error thrown when stream setup fails. Includes HTTP status code and user-friendly message for the response.
+ */
+export class StreamSetupError extends Error {
+
+  public readonly statusCode: number;
+  public readonly userMessage: string;
+
+  constructor(message: string, statusCode: number, userMessage: string) {
+
+    super(message);
+
+    this.name = "StreamSetupError";
+    this.statusCode = statusCode;
+    this.userMessage = userMessage;
+  }
+}
+
+/**
+ * Options for creating a page with capture.
+ */
+export interface CreatePageWithCaptureOptions {
+
+  // Callback invoked on FFmpeg process errors (only used in ffmpeg capture mode).
+  onFFmpegError?: (error: Error) => void;
+
+  // The resolved site profile for video handling.
+  profile: ResolvedSiteProfile;
+
+  // The stream ID string for logging (e.g., "cnn-5jecl6").
+  streamId: string;
+
+  // The URL to navigate to and capture.
+  url: string;
+}
+
+/**
+ * Result from creating a page with capture. Contains everything needed to create a segmenter and continue with stream setup.
+ */
+export interface CreatePageWithCaptureResult {
+
+  // The output stream for the segmenter. For native fMP4 mode, this is the raw capture. For WebM+FFmpeg mode, this is FFmpeg's fMP4 output.
+  captureStream: Readable;
+
+  // The video context (page or frame containing the video element).
+  context: Frame | Page;
+
+  // The FFmpeg process if using WebM+FFmpeg mode, null otherwise.
+  ffmpegProcess: FFmpegProcess | null;
+
+  // The browser page for this capture.
+  page: Page;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Request ID Generation
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Generates a short alphanumeric request ID for log correlation. The ID is 6 characters to keep log messages readable while providing enough uniqueness for
+ * practical debugging. With 36 possible characters (a-z, 0-9), there are 2.1 billion possible IDs, making collisions unlikely during any debugging session.
+ * @returns A 6-character alphanumeric string.
+ */
+function generateRequestId(): string {
+
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+  let result = "";
+
+  for(let i = 0; i < 6; i++) {
+
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+
+  return result;
+}
+
+/**
+ * Generates a concise stream identifier for logging purposes. The identifier combines the channel name or hostname with a unique request ID, making it easy to
+ * trace related log messages. We prefer the channel name when available because it's more meaningful than a hostname.
+ * @param channelName - The channel name if streaming a named channel.
+ * @param url - The URL being streamed.
+ * @returns A concise stream identifier.
+ */
+export function generateStreamId(channelName: string | undefined, url: string | undefined): string {
+
+  const requestId = generateRequestId();
+
+  // If we have a channel name, use it as the prefix. Channel names are short and meaningful (e.g., "nbc", "espn").
+  if(channelName) {
+
+    return [ channelName, "-", requestId ].join("");
+  }
+
+  // For direct URL requests, extract the hostname for the prefix. We remove the www. prefix since it adds no value.
+  if(url) {
+
+    try {
+
+      const parsed = new URL(url);
+
+      // Remove the www. prefix for cleaner display.
+      const hostname = parsed.hostname.replace(/^www\./, "");
+
+      return [ hostname, "-", requestId ].join("");
+    } catch(_error) {
+
+      // If URL parsing fails, use a truncated version of the URL. This handles malformed URLs gracefully.
+      const truncated = url.length > 20 ? [ url.substring(0, 20), "..." ].join("") : url;
+
+      return [ truncated, "-", requestId ].join("");
+    }
+  }
+
+  // Fallback when neither channel name nor URL is available. This shouldn't happen in normal operation but provides a valid ID for edge cases.
+  return [ "unknown-", requestId ].join("");
+}
+
+// ─────────────────────────────────────────────────────────────
+// URL Validation
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Validates a URL before attempting to navigate to it. This function checks for supported protocols, prevents local file access, and ensures the URL is properly
+ * formatted. Validating URLs before navigation prevents security issues and provides clear error messages.
+ * @param url - The URL to validate.
+ * @returns Validation result with optional reason for failure.
+ */
+export function validateStreamUrl(url: string | undefined): UrlValidation {
+
+  // A URL is required. This catches both undefined and empty string.
+  if(!url) {
+
+    return { reason: "URL is required.", valid: false };
+  }
+
+  try {
+
+    const parsed = new URL(url);
+
+    // We support HTTP, HTTPS, and chrome: protocols. HTTP and HTTPS are standard web protocols, while chrome: URLs are used for internal pages like
+    // chrome://gpu for diagnostics. Other protocols (javascript:, data:, blob:) are not supported.
+    const allowedProtocols = [ "chrome:", "http:", "https:" ];
+
+    if(!allowedProtocols.includes(parsed.protocol)) {
+
+      return { reason: [ "Unsupported protocol: ", parsed.protocol ].join(""), valid: false };
+    }
+
+    // Local file access is explicitly blocked for security reasons. While the URL constructor wouldn't typically parse a file: URL through the protocol check
+    // above, we check explicitly for defense in depth.
+    if(parsed.protocol === "file:") {
+
+      return { reason: "Local file access is not permitted.", valid: false };
+    }
+
+    return { valid: true };
+  } catch(_error) {
+
+    // The URL constructor throws for invalid URLs. We catch this and return a clear error message.
+    return { reason: "Invalid URL format.", valid: false };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Page and Capture Creation
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Creates a browser page with media capture and navigates to the URL. This is the reusable core function used by both initial stream setup and tab replacement
+ * recovery. It handles:
+ * - Creating a new browser page with CSP bypass
+ * - Initializing media capture (native fMP4 or WebM+FFmpeg)
+ * - Navigating to the URL with retry
+ * - Setting up video playback via tuneToChannel()
+ *
+ * The caller is responsible for:
+ * - Creating the segmenter and piping captureStream to it
+ * - Registering/updating the stream in the registry
+ * - Starting/updating the health monitor
+ * - Handling cleanup on failure
+ *
+ * @param options - Options for page and capture creation.
+ * @returns The page, context, capture stream, and FFmpeg process (if any).
+ * @throws Error if page creation, capture initialization, or navigation fails.
+ */
+export async function createPageWithCapture(options: CreatePageWithCaptureOptions): Promise<CreatePageWithCaptureResult> {
+
+  const { onFFmpegError, profile, streamId, url } = options;
+
+  // Create browser page.
+  const browser = await getCurrentBrowser();
+  const page = await browser.newPage();
+
+  registerManagedPage(page);
+
+  await page.setBypassCSP(true);
+
+  // Select MIME type based on capture mode. FFmpeg mode is more stable for long recordings because Chrome's native fMP4 MediaRecorder can become unstable.
+  const useFFmpeg = CONFIG.streaming.captureMode === "ffmpeg";
+  const captureMimeType = useFFmpeg ? WEBM_FFMPEG_MIME_TYPE : NATIVE_FMP4_MIME_TYPE;
+
+  // Track the output stream that will be sent to the segmenter and FFmpeg process if used.
+  let outputStream: Readable;
+  let ffmpegProcess: FFmpegProcess | null = null;
+
+  // Initialize media stream capture.
+  try {
+
+    const streamOptions = {
+
+      audio: true,
+      audioBitsPerSecond: CONFIG.streaming.audioBitsPerSecond,
+      mimeType: captureMimeType,
+      video: true,
+      videoBitsPerSecond: CONFIG.streaming.videoBitsPerSecond,
+      videoConstraints: {
+
+        mandatory: {
+
+          maxFrameRate: 60,
+          maxHeight: getEffectiveViewport(CONFIG).height,
+          maxWidth: getEffectiveViewport(CONFIG).width,
+          minFrameRate: CONFIG.streaming.frameRate,
+          minHeight: getEffectiveViewport(CONFIG).height,
+          minWidth: getEffectiveViewport(CONFIG).width
+        }
+      }
+    } as unknown as Parameters<typeof getStream>[1];
+
+    const streamPromise = getStream(page, streamOptions);
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+
+      setTimeout(() => {
+
+        reject(new Error("Stream initialization timed out."));
+      }, CONFIG.streaming.navigationTimeout);
+    });
+
+    const stream = await Promise.race([ streamPromise, timeoutPromise ]);
+
+    // For FFmpeg mode, spawn FFmpeg to transcode the WebM stream to fMP4. FFmpeg copies the H264 video and transcodes Opus audio to AAC.
+    if(useFFmpeg) {
+
+      const ffmpeg = spawnFFmpeg(CONFIG.streaming.audioBitsPerSecond, (error) => {
+
+        LOG.error("FFmpeg process error: %s.", formatError(error));
+
+        if(onFFmpegError) {
+
+          onFFmpegError(error);
+        }
+      }, streamId);
+
+      ffmpegProcess = ffmpeg;
+
+      // Handle pipe errors on stdout. Stdin errors are handled by pipeline() below.
+      ffmpeg.stdout.on("error", (error) => {
+
+        const errorMessage = formatError(error);
+
+        if(errorMessage.includes("EPIPE")) {
+
+          LOG.debug("FFmpeg stdout pipe closed: %s.", errorMessage);
+        } else {
+
+          LOG.error("FFmpeg stdout pipe error: %s.", errorMessage);
+          ffmpeg.kill();
+
+          if(onFFmpegError) {
+
+            onFFmpegError(error);
+          }
+        }
+      });
+
+      // Pipe the WebM capture stream to FFmpeg's stdin using pipeline() for proper cleanup. When FFmpeg is killed during tab replacement, pipeline() automatically
+      // destroys the source stream, preventing "write after end" errors that would occur with .pipe().
+      pipeline(stream as unknown as Readable, ffmpeg.stdin).catch((error) => {
+
+        const errorMessage = formatError(error);
+
+        // EPIPE, "write after end", and "Premature close" errors are expected during cleanup when FFmpeg is killed or the capture stream is destroyed.
+        if(errorMessage.includes("EPIPE") || errorMessage.includes("write after end") || errorMessage.includes("Premature close")) {
+
+          return;
+        }
+
+        // Unexpected pipeline errors require cleanup.
+        LOG.error("Capture pipeline error: %s.", errorMessage);
+        ffmpeg.kill();
+
+        if(onFFmpegError) {
+
+          onFFmpegError(error);
+        }
+      });
+
+      // Use FFmpeg's stdout (fMP4 output) as the output stream for segmentation.
+      outputStream = ffmpeg.stdout;
+    } else {
+
+      // Native fMP4 mode: Use the raw capture stream directly.
+      outputStream = stream as unknown as Readable;
+    }
+  } catch(error) {
+
+    // Clean up on capture initialization failure.
+    unregisterManagedPage(page);
+
+    if(!page.isClosed()) {
+
+      page.close().catch(() => {});
+    }
+
+    throw error;
+  }
+
+  // Navigate and set up playback. For noVideo profiles, just navigate without video setup.
+  let context: Frame | Page;
+
+  try {
+
+    if(profile.noVideo === false) {
+
+      // Since we don't pass an earlySuccessCheck, retryOperation will always return the value (not void). The type assertion is safe.
+      const tuneResult = await retryOperation(
+        async (): Promise<{ context: Frame | Page }> => {
+
+          return tuneToChannel(page, url, profile);
+        },
+        CONFIG.streaming.maxNavigationRetries,
+        CONFIG.streaming.navigationTimeout,
+        "page navigation for " + url,
+        undefined,
+        () => page.isClosed()
+      ) as { context: Frame | Page };
+
+      context = tuneResult.context;
+    } else {
+
+      await page.goto(url);
+      context = page;
+    }
+  } catch(error) {
+
+    // Clean up on navigation failure.
+    if(ffmpegProcess) {
+
+      ffmpegProcess.kill();
+    }
+
+    unregisterManagedPage(page);
+
+    if(!page.isClosed()) {
+
+      page.close().catch(() => {});
+    }
+
+    throw error;
+  }
+
+  // Resize and minimize window.
+  await resizeAndMinimizeWindow(page, !profile.noVideo);
+
+  return {
+
+    captureStream: outputStream,
+    context,
+    ffmpegProcess,
+    page
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Stream Setup
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Sets up a stream: validates input, creates browser page, initializes capture, navigates to URL, and starts health monitoring.
+ *
+ * This function handles all common stream setup logic. The caller is responsible for:
+ * - Connecting the returned captureStream to the appropriate output (HTTP response, FFmpeg, etc.)
+ * - Registering the stream in the registry
+ * - Triggering cleanup when the stream ends
+ *
+ * @param options - Stream configuration options.
+ * @param onCircuitBreak - Callback invoked when the circuit breaker trips (stream unrecoverable).
+ * @returns Setup result with capture stream, cleanup function, and metadata.
+ * @throws StreamSetupError if setup fails with appropriate status code and message.
+ */
+export async function setupStream(options: StreamSetupOptions, onCircuitBreak: () => void): Promise<StreamSetupResult> {
+
+  const { channel, channelName, noVideo, onTabReplacementFactory, profileOverride, url } = options;
+
+  // Generate stream identifiers early so all log messages include them.
+  const streamId = generateStreamId(channelName, url);
+  const numericStreamId = getNextStreamId();
+  const startTime = new Date();
+
+  // Create and register the AbortController for this stream. This allows pending evaluate calls to be cancelled immediately when the stream is terminated.
+  const abortController = new AbortController();
+
+  registerAbortController(streamId, abortController);
+
+  // Resolve the profile for this stream.
+  const profileResult = channel ? getProfileForChannel(channel) : getProfileForUrl(url);
+  let profile = profileResult.profile;
+  let profileName = profileResult.profileName;
+
+  // Wrap the setup in stream context for log correlation.
+  return runWithStreamContext({ channelName: channel?.name, streamId, url }, async () => {
+
+    // Apply profile override if specified.
+    if(profileOverride) {
+
+      const validProfiles = getProfiles().map((p) => p.name);
+
+      if(validProfiles.includes(profileOverride)) {
+
+        profile = resolveProfile(profileOverride);
+        profileName = profileOverride;
+
+        LOG.info("Profile overridden to '%s' via query parameter.", profileOverride);
+      } else {
+
+        LOG.warn("Unknown profile override '%s', using resolved profile.", profileOverride);
+      }
+    }
+
+    // Apply noVideo override if specified.
+    if(noVideo) {
+
+      profile = { ...profile, noVideo: true };
+    }
+
+    // Create the tab replacement handler if a factory was provided. This is done after profile resolution so the handler has access to the final profile.
+    const onTabReplacement = onTabReplacementFactory ? onTabReplacementFactory(numericStreamId, streamId, profile) : undefined;
+
+    // Validate URL.
+    const validation = validateStreamUrl(url);
+
+    if(!validation.valid) {
+
+      LOG.error("Invalid URL requested: %s - %s.", url, validation.reason ?? "Unknown error");
+
+      throw new StreamSetupError(
+        [ "Invalid URL: ", validation.reason ?? "Unknown error" ].join(""),
+        400,
+        validation.reason ?? "Invalid URL."
+      );
+    }
+
+    // Check concurrent stream limit.
+    if(getStreamCount() >= CONFIG.streaming.maxConcurrentStreams) {
+
+      LOG.warn("Concurrent stream limit reached (%s/%s). Rejecting request.", getStreamCount(), CONFIG.streaming.maxConcurrentStreams);
+
+      throw new StreamSetupError(
+        "Concurrent stream limit reached.",
+        503,
+        [ "Maximum concurrent streams (", String(CONFIG.streaming.maxConcurrentStreams), ") reached. Try again later." ].join("")
+      );
+    }
+
+    // Create page and start capture using the shared function. This handles browser page creation, capture initialization, FFmpeg spawning, and navigation with retry.
+    let captureResult: CreatePageWithCaptureResult;
+
+    try {
+
+      captureResult = await createPageWithCapture({
+
+        onFFmpegError: onCircuitBreak,
+        profile,
+        streamId,
+        url
+      });
+    } catch(error) {
+
+      // createPageWithCapture handles its own cleanup on failure (closes page, kills FFmpeg).
+      const errorMessage = formatError(error);
+      const isBenign = errorMessage.toLowerCase().includes("abort") || errorMessage.toLowerCase().includes("session closed");
+
+      if(!isBenign) {
+
+        LOG.error("Stream setup failed for %s: %s.", url, errorMessage);
+      }
+
+      throw new StreamSetupError("Stream error.", 500, "Failed to start stream.");
+    }
+
+    const { captureStream, context, ffmpegProcess, page } = captureResult;
+
+    // Monitor stream info for status updates.
+    const monitorStreamInfo: MonitorStreamInfo = {
+
+      channelName: channel?.name ?? null,
+      numericStreamId,
+      startTime
+    };
+
+    // Start the health monitor for this stream.
+    const stopMonitor = monitorPlaybackHealth(page, context, profile, url, streamId, monitorStreamInfo, onCircuitBreak, onTabReplacement);
+
+    // Cleanup function. Releases all resources associated with the stream. Idempotent - safe to call multiple times.
+    let cleanupCompleted = false;
+
+    const cleanup = async (): Promise<void> => {
+
+      if(cleanupCompleted) {
+
+        return;
+      }
+
+      cleanupCompleted = true;
+
+      // Stop the health monitor first.
+      stopMonitor();
+
+      // Kill the FFmpeg process if using WebM+FFmpeg mode.
+      if(ffmpegProcess) {
+
+        ffmpegProcess.kill();
+      }
+
+      // Unregister from managed pages.
+      unregisterManagedPage(page);
+
+      // Close the browser page (fire-and-forget to avoid blocking on stuck pages).
+      if(!page.isClosed()) {
+
+        page.close().catch((error) => {
+
+          LOG.warn("Page close error during cleanup: %s.", formatError(error));
+        });
+      }
+
+      // Re-minimize the browser window.
+      await minimizeBrowserWindow();
+    };
+
+    // Return the setup result.
+    return {
+
+      captureStream,
+      channelName: channel?.name ?? null,
+      cleanup,
+      ffmpegProcess,
+      numericStreamId,
+      page,
+      profile,
+      profileName,
+      startTime,
+      stopMonitor,
+      streamId,
+      url
+    };
+  });
+}
