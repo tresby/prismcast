@@ -1,7 +1,7 @@
 {
   "name": "prismcast",
   "displayName": "PrismCast",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Browser-based live TV capture server for Channels DVR and other streaming clients.",
   "author": {
     "name": "HJD",
@@ -47,6 +47,10 @@
     "url": "git://github.com/hjdhjd/prismcast.git"
   },
   "type": "module",
+  "files": [
+    "bin/",
+    "dist/"
+  ],
   "bin": {
     "prismcast": "./bin/prismcast"
   },
