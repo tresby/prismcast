@@ -4,12 +4,10 @@
  */
 import type { Express, Request, Response } from "express";
 import { endLoginMode, getLoginStatus, startLoginMode } from "../browser/index.js";
-import { getChannel } from "../channels/index.js";
+import { getResolvedChannel, resolveProviderKey } from "../config/providers.js";
+import { getDomainConfig } from "../config/sites.js";
 
-/*
- * AUTHENTICATION ROUTES
- *
- * These routes manage the login workflow for TV provider authentication. Many streaming channels require users to authenticate with their TV provider (cable,
+/* These routes manage the login workflow for TV provider authentication. Many streaming channels require users to authenticate with their TV provider (cable,
  * satellite, or streaming service) before content can be accessed.
  *
  * The login flow works as follows:
@@ -74,7 +72,9 @@ export function setupAuthEndpoint(app: Express): void {
 
     if(body.channel) {
 
-      const channel = getChannel(body.channel);
+      // Resolve provider selection and get the channel. This respects both user-defined channel overrides and provider selections (e.g., Disney+ vs ESPN.com).
+      const resolvedKey = resolveProviderKey(body.channel);
+      const channel = getResolvedChannel(resolvedKey);
 
       if(!channel) {
 
@@ -98,6 +98,14 @@ export function setupAuthEndpoint(app: Express): void {
       res.status(400).json(response);
 
       return;
+    }
+
+    // Check if the domain has a login URL override. Some sites (e.g., Fox.com) show different authentication options on their homepage vs their player page.
+    const domainConfig = getDomainConfig(url);
+
+    if(domainConfig?.loginUrl) {
+
+      url = domainConfig.loginUrl;
     }
 
     // Start login mode.

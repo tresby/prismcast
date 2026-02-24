@@ -2,23 +2,20 @@
  *
  * lifecycle.ts: Stream lifecycle management for PrismCast.
  */
+import type { KeyframeStats, SessionStats } from "./fmp4Segmenter.js";
 import { LOG, formatDuration, formatError, getAbortController, unregisterAbortController } from "../utils/index.js";
+import { formatKeyframeStatsSummary, formatSessionStatsSummary } from "./fmp4Segmenter.js";
 import { formatRecoveryMetricsSummary, getTotalRecoveryAttempts } from "./monitor.js";
 import { getStream, unregisterStream } from "./registry.js";
-import type { KeyframeStats } from "./fmp4Segmenter.js";
 import type { Nullable } from "../types/index.js";
 import type { Readable } from "node:stream";
 import type { RecoveryMetrics } from "./monitor.js";
 import { clearClients } from "./clients.js";
 import { clearShowName } from "./showInfo.js";
 import { emitStreamRemoved } from "./statusEmitter.js";
-import { formatKeyframeStatsSummary } from "./fmp4Segmenter.js";
 import { isGracefulShutdown } from "../browser/index.js";
 
-/*
- * STREAM LIFECYCLE
- *
- * This module provides the authoritative stream termination logic. All code paths that need to terminate a stream should call terminateStream() from this module. This
+/* This module provides the authoritative stream termination logic. All code paths that need to terminate a stream should call terminateStream() from this module. This
  * ensures consistent cleanup behavior including:
  *
  * - Stopping the segmenter
@@ -166,12 +163,16 @@ export function terminateStream(streamId: number, channelName: string, reason: s
     streamInfo.ffmpegProcess.kill();
   }
 
-  // Capture keyframe statistics before stopping the segmenter. The stats are a snapshot of the accumulated state, so they remain valid after stop() is called.
+  // Capture keyframe and session statistics before stopping the segmenter. The stats are snapshots of the accumulated state, so they remain valid after stop().
   let keyframeStats: Nullable<KeyframeStats> = null;
+  let segmentCount = 0;
+  let sessionStats: Nullable<SessionStats> = null;
 
   if(streamInfo?.segmenter) {
 
     keyframeStats = streamInfo.segmenter.getKeyframeStats();
+    segmentCount = streamInfo.segmenter.getSegmentIndex();
+    sessionStats = streamInfo.segmenter.getSessionStats();
     streamInfo.segmenter.stop();
   }
 
@@ -195,9 +196,9 @@ export function terminateStream(streamId: number, channelName: string, reason: s
     // Close the browser page. Skip during graceful shutdown since closeBrowser() will close all pages and we'd get spurious "Target closed" errors.
     if(!isGracefulShutdown() && !streamInfo.page.isClosed()) {
 
-      streamInfo.page.close().catch((error) => {
+      streamInfo.page.close().catch((error: unknown) => {
 
-        LOG.warn("Error closing page for stream %s: %s.", streamId, formatError(error));
+        LOG.debug("streaming:hls", "Error closing page for stream %s: %s.", streamId, formatError(error));
       });
     }
   }
@@ -245,5 +246,16 @@ export function terminateStream(streamId: number, channelName: string, reason: s
   } else {
 
     streamLog.info("Stream ended after %s%s.", formatDuration(durationMs), reasonSuffix);
+  }
+
+  // Log session-level segmenter statistics at debug level. This provides A-V sync, tab replacement, and data integrity metrics for diagnosing timestamp issues.
+  if(sessionStats) {
+
+    const sessionSummary = formatSessionStatsSummary(sessionStats, segmentCount);
+
+    if(sessionSummary) {
+
+      streamLog.debug("streaming:segmenter", "%s", sessionSummary);
+    }
   }
 }

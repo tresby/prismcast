@@ -4,14 +4,12 @@
  */
 import type { Nullable } from "../types/index.js";
 import fs from "node:fs";
+import { getDataDir } from "../config/paths.js";
 import os from "node:os";
 import path from "node:path";
 import url from "node:url";
 
-/*
- * PLATFORM DETECTION UTILITIES
- *
- * These utilities provide platform detection and service-related functionality. The isRunningAsService() function checks for an environment variable set by the
+/* These utilities provide platform detection and service-related functionality. The isRunningAsService() function checks for an environment variable set by the
  * service definition, allowing the application to adapt its restart behavior based on whether it's managed by a service manager or running standalone.
  */
 
@@ -20,6 +18,9 @@ export type Platform = "darwin" | "linux" | "windows";
 
 // Type representing supported service managers.
 export type ServiceManager = "launchd" | "systemd" | "windows-scheduler";
+
+// Environment variable name used to detect container mode.
+const CONTAINER_ENV_VAR = "PRISMCAST_CONTAINER";
 
 // Environment variable name used to detect service mode.
 const SERVICE_ENV_VAR = "PRISMCAST_SERVICE";
@@ -97,6 +98,28 @@ export function isRunningAsService(): boolean {
 }
 
 /**
+ * Checks whether PrismCast is running inside a Docker container. Two-tier detection: the explicit PRISMCAST_CONTAINER environment variable set in our Dockerfile is
+ * the primary signal; the /.dockerenv marker file (created by Docker in every container) is the backup for custom images that omit the environment variable.
+ * @returns True if running inside a container, false otherwise.
+ */
+export function isRunningInContainer(): boolean {
+
+  if(process.env[CONTAINER_ENV_VAR] === "1") {
+
+    return true;
+  }
+
+  // Backup: Docker creates /.dockerenv in every container. This catches custom images that don't set PRISMCAST_CONTAINER.
+  try {
+
+    return fs.existsSync("/.dockerenv");
+  } catch {
+
+    return false;
+  }
+}
+
+/**
  * Returns the path where the service file should be installed for the current platform.
  * @returns The absolute path to the service file location.
  */
@@ -118,8 +141,8 @@ export function getServiceFilePath(): string {
 
     case "windows": {
 
-      // Windows Task Scheduler doesn't use a file path in the same way. We return a marker path for consistency.
-      return path.join(homeDir, ".prismcast", "service-installed.marker");
+      // Windows Task Scheduler doesn't use a file path in the same way. We return a marker path inside the data directory for consistency.
+      return path.join(getDataDir(), "service-installed.marker");
     }
 
     default: {
@@ -204,21 +227,21 @@ export function getPrismCastWorkingDirectory(): string {
 }
 
 /**
- * Returns the data directory path for PrismCast (~/.prismcast).
+ * Returns the data directory path for PrismCast. Delegates to the centralized paths module.
  * @returns The absolute path to the data directory.
  */
 export function getDataDirectory(): string {
 
-  return path.join(os.homedir(), ".prismcast");
+  return getDataDir();
 }
 
 /**
- * Returns the directory path for service stdout/stderr output. This is the same as the data directory (~/.prismcast) to keep all PrismCast files in one place.
+ * Returns the directory path for service stdout/stderr output. This is the same as the data directory to keep all PrismCast files in one place.
  * @returns The absolute path to the service logs directory.
  */
 export function getLogsDirectory(): string {
 
-  return getDataDirectory();
+  return getDataDir();
 }
 
 /**

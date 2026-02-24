@@ -2,207 +2,394 @@
  *
  * index.ts: Channel definitions for PrismCast.
  */
-import type { Channel, ChannelMap } from "../types/index.js";
+import type { ChannelMap } from "../types/index.js";
 
-/*
- * CHANNEL DEFINITIONS
+/* Map short channel names to streaming configurations. Users request streams via /stream/nbc instead of full URLs.
  *
- * The channels object maps short channel names to their streaming URLs and optional profile hints. Users can request streams using simple names like /stream/nbc
- * instead of remembering full URLs. The optional profile property allows channels to explicitly declare which site profile to use, which is useful when the URL
- * domain does not match the expected behavior. Channels with profile "auto" or without a profile property use URL-based domain profile detection.
+ * Channel properties:
+ * - name: Display name shown in Channels DVR (required for canonical channels, inherited by variants).
+ * - url: Streaming site URL.
+ * - profile: Site behavior profile (optional). Use "auto" or omit to auto-detect from URL domain. See config/profiles.ts for available profiles.
+ * - stationId: Gracenote station ID for guide data (optional). Local affiliates (ABC, CBS, NBC) vary by region.
+ * - channelSelector: Channel identifier for multi-channel pages. For thumbnailRow/tileClick profiles, this is a slug matched against image URLs. For foxGrid
+ *   (foxLive), this is the station code matched against GuideChannelLogo button titles (e.g., FOXD2C, FNC, FS1). For guideGrid (huluLive), this is the exact
+ *   channel name matched against image alt text. For hboGrid (hboMax), this is the channel name matched against the live channel rail tile text (e.g., HBO, HBO
+ *   Hits). For slingGrid (slingLive), this is the channel name as it appears in the Sling TV guide grid data-testid attributes. For youtubeGrid (youtubeTV), this
+ *   is the channel name from the YouTube TV guide or a network name (e.g., NBC) for local affiliates.
+ * - provider: Display name override for the provider selection dropdown (optional). Normally auto-derived from the URL domain via DOMAIN_CONFIG in
+ *   config/profiles.ts. Only needed when a channel's display name should differ from the domain-level default.
+ *
+ * Provider variants: Channels are grouped by key prefix convention — a key like "espn-disneyplus" is a variant of "espn" because it starts with "espn-" and
+ * "espn" exists as a channel. Variants inherit `name` and `stationId` from the canonical entry. See config/providers.ts for grouping details.
+ *
+ * IMPORTANT: Avoid hyphenated keys that would unintentionally match an existing channel. If "foo" exists, "foo-bar" becomes its variant. Use non-hyphenated keys
+ * for independent channels (e.g., "cnni" instead of "cnn-international").
  */
 /* eslint-disable @stylistic/max-len */
 export const CHANNELS: ChannelMap = {
 
-  // Sites with multiple video elements requiring ready-state selection. ABC station ID varies by local affiliate.
-  abc: { name: "ABC", profile: "auto", url: "https://abc.com/watch-live/b2f23a6e-a2a4-4d63-bd3b-e330921b0942" },
-
-  // A&E family channels use standard players that work with the default profile.
+  abc: { name: "ABC", url: "https://abc.com/watch-live" },
+  "abc-hulu": { channelSelector: "ABC", url: "https://www.hulu.com/live" },
+  "abc-sling": { channelSelector: "ABC", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "abc-yttv": { channelSelector: "ABC", url: "https://tv.youtube.com/live" },
+  abcnews: { channelSelector: "ABC News Live", name: "ABC News Live", stationId: "113380", url: "https://www.hulu.com/live" },
+  "abcnews-sling": { channelSelector: "ABC News Live", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "abcnews-yttv": { channelSelector: "ABC News Live", url: "https://tv.youtube.com/live" },
   ae: { name: "A&E", stationId: "51529", url: "https://play.aetv.com/live" },
-
-  // Discovery and Warner Brothers Discovery family channels use the fullscreen API profile.
-  ahc: { name: "American Heroes", profile: "auto", stationId: "78808", url: "https://watch.foodnetwork.com/channel/ahc" },
-  animal: { name: "Animal Planet", profile: "auto", stationId: "57394", url: "https://watch.foodnetwork.com/channel/animal-planet" },
-
-  bigten: { name: "Big 10", profile: "auto", stationId: "58321", url: "https://www.foxsports.com/live/btn" },
-
-  // Keyboard fullscreen sites with dynamic content loading requiring network idle wait.
-  bravo: { name: "Bravo", profile: "auto", stationId: "58625", url: "https://www.nbc.com/live?brand=bravo&callsign=bravo_east" },
-  bravop: { name: "Bravo (Pacific)", profile: "auto", stationId: "73994", url: "https://www.nbc.com/live?brand=bravo&callsign=bravo_west" },
-
-  // Keyboard fullscreen sites with iframe-embedded players. CBS station ID varies by local affiliate.
-  cbs: { name: "CBS", profile: "auto", url: "https://www.cbs.com/live-tv/stream" },
-
-  // CNBC and CNN sites use standard players.
+  "ae-hulu": { channelSelector: "A&E", url: "https://www.hulu.com/live" },
+  "ae-sling": { channelSelector: "A&E", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  ahc: { name: "American Heroes", stationId: "78808", url: "https://watch.foodnetwork.com/channel/ahc" },
+  amc: { channelSelector: "AMC", name: "AMC", stationId: "59337", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "amc-yttv": { channelSelector: "AMC", url: "https://tv.youtube.com/live" },
+  amcthrillers: { channelSelector: "AMC Thrillers", name: "AMC Thrillers", stationId: "115678", url: "https://tv.youtube.com/live" },
+  "amcthrillers-sling": { channelSelector: "AMC Thrillers", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  animal: { name: "Animal Planet", stationId: "57394", url: "https://watch.foodnetwork.com/channel/animal-planet" },
+  "animal-hulu": { channelSelector: "Animal Planet", url: "https://www.hulu.com/live" },
+  "animal-yttv": { channelSelector: "Animal Planet", url: "https://tv.youtube.com/live" },
+  bbcamerica: { channelSelector: "BBC America", name: "BBC America", stationId: "64492", url: "https://tv.youtube.com/live" },
+  "bbcamerica-sling": { channelSelector: "BBC America", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  bbcnews: { channelSelector: "BBC News", name: "BBC News", stationId: "36844", url: "https://tv.youtube.com/live" },
+  "bbcnews-sling": { channelSelector: "BBC News", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  bet: { name: "BET", stationId: "63236", url: "https://www.bet.com/live-tv" },
+  "bet-hulu": { channelSelector: "BET", url: "https://www.hulu.com/live" },
+  "bet-sling": { channelSelector: "BET", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "bet-yttv": { channelSelector: "BET", url: "https://tv.youtube.com/live" },
+  bigten: { name: "Big 10", stationId: "58321", url: "https://www.foxsports.com/live/btn" },
+  "bigten-foxcom": { channelSelector: "BTN", url: "https://www.fox.com/live/channels" },
+  "bigten-hulu": { channelSelector: "Big Ten Network", url: "https://www.hulu.com/live" },
+  "bigten-yttv": { channelSelector: "BTN", url: "https://tv.youtube.com/live" },
+  bloomberg: { channelSelector: "Bloomberg Television", name: "Bloomberg Television", stationId: "71799", url: "https://www.hulu.com/live" },
+  "bloomberg-sling": { channelSelector: "Bloomberg TV+", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "bloomberg-yttv": { channelSelector: "Bloomberg TV+", url: "https://tv.youtube.com/live" },
+  bravo: { name: "Bravo", stationId: "58625", url: "https://www.nbc.com/live?brand=bravo&callsign=bravo_east" },
+  "bravo-hulu": { channelSelector: "Bravo", url: "https://www.hulu.com/live" },
+  "bravo-sling": { channelSelector: "Bravo", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "bravo-yttv": { channelSelector: "Bravo", url: "https://tv.youtube.com/live" },
+  bravop: { name: "Bravo (Pacific)", stationId: "73994", url: "https://www.nbc.com/live?brand=bravo&callsign=bravo_west" },
+  cbs: { name: "CBS", url: "https://www.cbs.com/live-tv/stream" },
+  "cbs-hulu": { channelSelector: "CBS", url: "https://www.hulu.com/live" },
+  "cbs-paramountplus": { name: "CBS", url: "https://www.paramountplus.com/live-tv/" },
+  "cbs-yttv": { channelSelector: "CBS", url: "https://tv.youtube.com/live" },
+  cbsnews: { channelSelector: "CBS News 24/7", name: "CBS News 24/7", stationId: "104846", url: "https://www.hulu.com/live" },
+  "cbsnews-sling": { channelSelector: "CBS News 24/7", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  cbssports: { channelSelector: "CBS Sports Network", name: "CBS Sports Network", stationId: "59250", url: "https://www.hulu.com/live" },
+  "cbssports-yttv": { channelSelector: "CBS Sports Network", url: "https://tv.youtube.com/live" },
+  cmt: { channelSelector: "CMT", name: "CMT", stationId: "59440", url: "https://www.hulu.com/live" },
+  "cmt-yttv": { channelSelector: "CMT", url: "https://tv.youtube.com/live" },
   cnbc: { name: "CNBC", stationId: "58780", url: "https://www.cnbc.com/live-tv" },
-  // cnbc: { channelSelector: "CNBC_US", name: "CNBC", profile: "keyboardDynamicMultiVideo", stationId: "58780", url: "https://www.usanetwork.com/live" },
+  "cnbc-hulu": { channelSelector: "CNBC", url: "https://www.hulu.com/live" },
+  "cnbc-usa": { channelSelector: "CNBC_US", url: "https://www.usanetwork.com/live" },
+  "cnbc-yttv": { channelSelector: "CNBC", url: "https://tv.youtube.com/live" },
   cnn: { name: "CNN", stationId: "58646", url: "https://www.cnn.com/videos/cnn" },
+  "cnn-hulu": { channelSelector: "CNN", url: "https://www.hulu.com/live" },
+  "cnn-sling": { channelSelector: "CNN", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "cnn-yttv": { channelSelector: "CNN", url: "https://tv.youtube.com/live" },
   cnni: { name: "CNN International", stationId: "83110", url: "https://www.cnn.com/videos/cnn-i" },
-
-  // Discovery and Warner Brothers Discovery family channels use the fullscreen API profile.
-  cooking: { name: "Cooking", profile: "auto", stationId: "68065", url: "https://watch.foodnetwork.com/channel/cooking-channel" },
-
-  // C-SPAN channels use the Brightcove player profile.
-  cspan: { name: "C-SPAN", profile: "auto", stationId: "68344", url: "https://www.c-span.org/networks/?autoplay=true&channel=c-span" },
-  cspan2: { name: "C-SPAN 2", profile: "auto", stationId: "68334", url: "https://www.c-span.org/networks/?autoplay=true&channel=c-span-2" },
-  cspan3: { name: "C-SPAN 3", profile: "auto", stationId: "68332", url: "https://www.c-span.org/networks/?autoplay=true&channel=c-span-3" },
-
-  // Discovery and Warner Brothers Discovery family channels use the fullscreen API profile.
-  discovery: { name: "Discovery", profile: "auto", stationId: "56905", url: "https://watch.foodnetwork.com/channel/discovery" },
-  discoverylife: { name: "Discovery Life", profile: "auto", stationId: "92204", url: "https://watch.foodnetwork.com/channel/discovery-life" },
-  discoveryturbo: { name: "Discovery Turbo", profile: "auto", stationId: "31046", url: "https://watch.foodnetwork.com/channel/motortrend" },
-
-  // Multi-channel keyboard players requiring channel selection from the UI.
-  e: { channelSelector: "E-_East", name: "E!", profile: "auto", stationId: "61812", url: "https://www.usanetwork.com/live" },
-  ep: { channelSelector: "E-_West", name: "E! (Pacific)", profile: "auto", stationId: "91579", url: "https://www.usanetwork.com/live" },
-
-  // Disney+ live channels using tile-based channel selection from the shared live TV page.
-  espn: { channelSelector: "poster_linear_espn_none", name: "ESPN", profile: "auto", stationId: "32645", url: "https://www.disneyplus.com/browse/live" },
-  espn2: { channelSelector: "poster_linear_espn2_none", name: "ESPN2", profile: "auto", stationId: "45507", url: "https://www.disneyplus.com/browse/live" },
-  espnacc: { channelSelector: "poster_linear_acc-network_none", name: "ACC Network", profile: "auto", stationId: "111871", url: "https://www.disneyplus.com/browse/live" },
-  espndeportes: { channelSelector: "poster_linear_espn-deportes_none", name: "ESPN Deportes", profile: "auto", stationId: "71914", url: "https://www.disneyplus.com/browse/live" },
-  espnews: { channelSelector: "poster_linear_espnews_none", name: "ESPNews", profile: "auto", stationId: "59976", url: "https://www.disneyplus.com/browse/live" },
-  espnsec: { channelSelector: "poster_linear_sec-network_none", name: "SEC Network", profile: "auto", stationId: "89714", url: "https://www.disneyplus.com/browse/live" },
-  espnu: { channelSelector: "poster_linear_espnu_none", name: "ESPNU", profile: "auto", stationId: "60696", url: "https://www.disneyplus.com/browse/live" },
-
-  // Iframe-embedded players with multiple video elements requiring network idle wait.
-  fbc: { name: "Fox Business", profile: "auto", stationId: "58718", url: "https://www.foxbusiness.com/video/5640669329001" },
-  fnc: { name: "Fox News", profile: "auto", stationId: "60179", url: "https://www.foxnews.com/video/5614615980001" },
-
-  // Discovery and Warner Brothers Discovery family channels use the fullscreen API profile.
-  food: { name: "Food Network", profile: "auto", stationId: "50747", url: "https://watch.foodnetwork.com/channel/food-network" },
-
-  foxdeportes: { name: "Fox Deportes", profile: "auto", stationId: "72189", url: "https://www.foxsports.com/live/foxdep" },
-  foxsoccerplus: { name: "Fox Soccer Plus", profile: "auto", stationId: "66879", url: "https://www.foxsports.com/live/fsp" },
-
-  // France24 channels require volume locking to prevent auto-muting.
-  france24: { name: "France 24", profile: "auto", stationId: "60961", url: "https://www.france24.com/en/live" },
-  france24fr: { name: "France 24 (French)", profile: "auto", stationId: "58685", url: "https://www.france24.com/fr/direct" },
-
-  fs1: { name: "FS1", profile: "auto", stationId: "82547", url: "https://www.foxsports.com/live/fs1" },
-  fs2: { name: "FS2", profile: "auto", stationId: "59305", url: "https://www.foxsports.com/live/fs2" },
-
-  // Keyboard fullscreen sites with multiple video elements requiring ready-state selection.
-  fx: { name: "FX", profile: "auto", stationId: "58574", url: "https://abc.com/watch-live/93256af4-5e80-4558-aa2e-2bdfffa119a0" },
-  fxm: { name: "FXM", profile: "auto", stationId: "70253", url: "https://abc.com/watch-live/d298ab7e-c6b1-4efa-ac6e-a52dceed92ee" },
-  fxp: { name: "FX (Pacific)", profile: "auto", stationId: "59814", url: "https://abc.com/watch-live/2cee3401-f63b-42d0-b32e-962fef610b9e" },
-  fxx: { name: "FXX", profile: "auto", stationId: "66379", url: "https://abc.com/watch-live/49f4a471-8d36-4728-8457-ea65cbbc84ea" },
-  fxxp: { name: "FXX (Pacific)", profile: "auto", stationId: "82571", url: "https://abc.com/watch-live/e4c83395-62ed-4a49-829a-c55ab3c33e7d" },
-
-  // A&E family channels use standard players that work with the default profile.
+  "cnni-hulu": { channelSelector: "CNN International", url: "https://www.hulu.com/live" },
+  "cnni-yttv": { channelSelector: "CNN International", url: "https://tv.youtube.com/live" },
+  "comedycentral": { channelSelector: "Comedy Central", name: "Comedy Central", stationId: "62420", url: "https://www.hulu.com/live" },
+  "comedycentral-sling": { channelSelector: "Comedy Central", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "comedycentral-yttv": { channelSelector: "Comedy Central", url: "https://tv.youtube.com/live" },
+  cooking: { name: "Cooking", stationId: "68065", url: "https://watch.foodnetwork.com/channel/cooking-channel" },
+  cspan: { name: "C-SPAN", stationId: "68344", url: "https://www.c-span.org/networks/?autoplay=true&channel=c-span" },
+  "cspan-hulu": { channelSelector: "C-SPAN", url: "https://www.hulu.com/live" },
+  "cspan-yttv": { channelSelector: "C-SPAN", url: "https://tv.youtube.com/live" },
+  cspan2: { name: "C-SPAN 2", stationId: "68334", url: "https://www.c-span.org/networks/?autoplay=true&channel=c-span-2" },
+  "cspan2-hulu": { channelSelector: "C-SPAN2", url: "https://www.hulu.com/live" },
+  "cspan2-yttv": { channelSelector: "C-SPAN2", url: "https://tv.youtube.com/live" },
+  cspan3: { name: "C-SPAN 3", stationId: "68332", url: "https://www.c-span.org/networks/?autoplay=true&channel=c-span-3" },
+  "cspan3-hulu": { channelSelector: "C-SPAN3", url: "https://www.hulu.com/live" },
+  "cspan3-yttv": { channelSelector: "C-SPAN3", url: "https://tv.youtube.com/live" },
+  cw: { channelSelector: "CW", name: "CW", url: "https://www.hulu.com/live" },
+  "cw-yttv": { channelSelector: "CW", url: "https://tv.youtube.com/live" },
+  discovery: { name: "Discovery", stationId: "56905", url: "https://watch.foodnetwork.com/channel/discovery" },
+  "discovery-hulu": { channelSelector: "Discovery", url: "https://www.hulu.com/live" },
+  "discovery-sling": { channelSelector: "Discovery", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "discovery-yttv": { channelSelector: "Discovery Channel", url: "https://tv.youtube.com/live" },
+  discoverylife: { name: "Discovery Life", stationId: "92204", url: "https://watch.foodnetwork.com/channel/discovery-life" },
+  discoveryturbo: { name: "Discovery Turbo", stationId: "31046", url: "https://watch.foodnetwork.com/channel/motortrend" },
+  "discoveryturbo-hulu": { channelSelector: "Discovery Turbo", url: "https://www.hulu.com/live" },
+  "discoveryturbo-sling": { channelSelector: "Discovery Turbo", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "discoveryturbo-yttv": { channelSelector: "Discovery Turbo", url: "https://tv.youtube.com/live" },
+  disney: { name: "Disney", stationId: "59684", url: "https://disneynow.com/watch-live?brand=004" },
+  "disney-hulu": { channelSelector: "Disney Channel", url: "https://www.hulu.com/live" },
+  "disney-sling": { channelSelector: "Disney Channel", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "disney-yttv": { channelSelector: "Disney Channel", url: "https://tv.youtube.com/live" },
+  disneyjr: { name: "Disney Jr.", stationId: "74885", url: "https://disneynow.com/watch-live?brand=008" },
+  "disneyjr-hulu": { channelSelector: "Disney Junior", url: "https://www.hulu.com/live" },
+  "disneyjr-yttv": { channelSelector: "Disney Junior", url: "https://tv.youtube.com/live" },
+  disneyxd: { name: "Disney XD", stationId: "60006", url: "https://disneynow.com/watch-live?brand=009" },
+  "disneyxd-hulu": { channelSelector: "Disney XD", url: "https://www.hulu.com/live" },
+  "disneyxd-yttv": { channelSelector: "Disney XD", url: "https://tv.youtube.com/live" },
+  e: { channelSelector: "E-_East", name: "E!", stationId: "61812", url: "https://www.usanetwork.com/live" },
+  "e-hulu": { channelSelector: "E!", url: "https://www.hulu.com/live" },
+  "e-sling": { channelSelector: "E!", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "e-yttv": { channelSelector: "E!", url: "https://tv.youtube.com/live" },
+  ep: { channelSelector: "E-_West", name: "E! (Pacific)", stationId: "91579", url: "https://www.usanetwork.com/live" },
+  espn: { name: "ESPN", stationId: "32645", url: "https://www.espn.com/watch/player?network=espn" },
+  "espn-disneyplus": { channelSelector: "poster_linear_espn_none", url: "https://www.disneyplus.com/browse/live" },
+  "espn-hulu": { channelSelector: "ESPN", url: "https://www.hulu.com/live" },
+  "espn-sling": { channelSelector: "ESPN", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "espn-yttv": { channelSelector: "ESPN", url: "https://tv.youtube.com/live" },
+  espn2: { name: "ESPN2", stationId: "45507", url: "https://www.espn.com/watch/player?network=espn2" },
+  "espn2-disneyplus": { channelSelector: "poster_linear_espn2_none", url: "https://www.disneyplus.com/browse/live" },
+  "espn2-hulu": { channelSelector: "ESPN2", url: "https://www.hulu.com/live" },
+  "espn2-sling": { channelSelector: "ESPN2", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "espn2-yttv": { channelSelector: "ESPN2", url: "https://tv.youtube.com/live" },
+  espnacc: { name: "ACC Network", stationId: "111871", url: "https://www.espn.com/watch/player?network=acc" },
+  "espnacc-disneyplus": { channelSelector: "poster_linear_acc-network_none", url: "https://www.disneyplus.com/browse/live" },
+  "espnacc-hulu": { channelSelector: "ACC Network", url: "https://www.hulu.com/live" },
+  "espnacc-yttv": { channelSelector: "ACC Network", url: "https://tv.youtube.com/live" },
+  espndeportes: { name: "ESPN Deportes", stationId: "71914", url: "https://www.espn.com/watch/player?network=espndeportes" },
+  "espndeportes-disneyplus": { channelSelector: "poster_linear_espn-deportes_none", url: "https://www.disneyplus.com/browse/live" },
+  "espndeportes-yttv": { channelSelector: "ESPN Deportes", url: "https://tv.youtube.com/live" },
+  espnews: { name: "ESPNews", stationId: "59976", url: "https://www.espn.com/watch/player?network=espnews" },
+  "espnews-disneyplus": { channelSelector: "poster_linear_espnews_none", url: "https://www.disneyplus.com/browse/live" },
+  "espnews-hulu": { channelSelector: "ESPNEWS", url: "https://www.hulu.com/live" },
+  "espnews-yttv": { channelSelector: "ESPNEWS", url: "https://tv.youtube.com/live" },
+  espnsec: { name: "SEC Network", stationId: "89714", url: "https://www.espn.com/watch/player?network=sec" },
+  "espnsec-disneyplus": { channelSelector: "poster_linear_sec-network_none", url: "https://www.disneyplus.com/browse/live" },
+  "espnsec-hulu": { channelSelector: "SEC Network", url: "https://www.hulu.com/live" },
+  "espnsec-yttv": { channelSelector: "SEC Network", url: "https://tv.youtube.com/live" },
+  espnu: { name: "ESPNU", stationId: "60696", url: "https://www.espn.com/watch/player?network=espnu" },
+  "espnu-disneyplus": { channelSelector: "poster_linear_espnu_none", url: "https://www.disneyplus.com/browse/live" },
+  "espnu-hulu": { channelSelector: "ESPNU", url: "https://www.hulu.com/live" },
+  "espnu-yttv": { channelSelector: "ESPNU", url: "https://tv.youtube.com/live" },
+  fbc: { name: "Fox Business", stationId: "58718", url: "https://www.foxbusiness.com/video/5640669329001" },
+  "fbc-foxcom": { channelSelector: "FBN", url: "https://www.fox.com/live/channels" },
+  "fbc-hulu": { channelSelector: "Fox Business", url: "https://www.hulu.com/live" },
+  "fbc-yttv": { channelSelector: "Fox Business", url: "https://tv.youtube.com/live" },
+  fnc: { name: "Fox News", stationId: "60179", url: "https://www.foxnews.com/video/5614615980001" },
+  "fnc-foxcom": { channelSelector: "FNC", url: "https://www.fox.com/live/channels" },
+  "fnc-hulu": { channelSelector: "Fox News", url: "https://www.hulu.com/live" },
+  "fnc-sling": { channelSelector: "Fox News", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "fnc-yttv": { channelSelector: "Fox News", url: "https://tv.youtube.com/live" },
+  food: { name: "Food Network", stationId: "50747", url: "https://watch.foodnetwork.com/channel/food-network" },
+  "food-hulu": { channelSelector: "Food Network", url: "https://www.hulu.com/live" },
+  "food-sling": { channelSelector: "Food Network", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "food-yttv": { channelSelector: "Food Network", url: "https://tv.youtube.com/live" },
+  fox: { channelSelector: "FOXD2C", name: "Fox", url: "https://www.fox.com/live/channels" },
+  "fox-hulu": { channelSelector: "Fox", url: "https://www.hulu.com/live" },
+  "fox-sling": { channelSelector: "FOX", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "fox-yttv": { channelSelector: "FOX", url: "https://tv.youtube.com/live" },
+  foxdeportes: { name: "Fox Deportes", stationId: "72189", url: "https://www.foxsports.com/live/foxdep" },
+  "foxdeportes-foxcom": { channelSelector: "FOXD", url: "https://www.fox.com/live/channels" },
+  "foxdeportes-yttv": { channelSelector: "Fox Deportes", url: "https://tv.youtube.com/live" },
+  foxsoccerplus: { name: "Fox Soccer Plus", stationId: "66879", url: "https://www.foxsports.com/live/fsp" },
+  "foxsoccerplus-yttv": { channelSelector: "FOX Soccer Plus", url: "https://tv.youtube.com/live" },
+  france24: { name: "France 24", stationId: "60961", url: "https://www.france24.com/en/live" },
+  "france24-sling": { channelSelector: "France 24 (English)", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  france24fr: { name: "France 24 (French)", stationId: "58685", url: "https://www.france24.com/fr/direct" },
+  "france24fr-sling": { channelSelector: "France 24", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  fs1: { name: "FS1", stationId: "82547", url: "https://www.foxsports.com/live/fs1" },
+  "fs1-foxcom": { channelSelector: "FS1", url: "https://www.fox.com/live/channels" },
+  "fs1-hulu": { channelSelector: "FS1", url: "https://www.hulu.com/live" },
+  "fs1-sling": { channelSelector: "FOX Sports 1", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "fs1-yttv": { channelSelector: "FS1", url: "https://tv.youtube.com/live" },
+  fs2: { name: "FS2", stationId: "59305", url: "https://www.foxsports.com/live/fs2" },
+  "fs2-foxcom": { channelSelector: "FS2", url: "https://www.fox.com/live/channels" },
+  "fs2-hulu": { channelSelector: "FS2", url: "https://www.hulu.com/live" },
+  "fs2-yttv": { channelSelector: "FS2", url: "https://tv.youtube.com/live" },
+  fx: { name: "FX", stationId: "58574", url: "https://abc.com/watch-live/93256af4-5e80-4558-aa2e-2bdfffa119a0" },
+  "fx-hulu": { channelSelector: "FX", url: "https://www.hulu.com/live" },
+  "fx-sling": { channelSelector: "FX", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "fx-yttv": { channelSelector: "FX", url: "https://tv.youtube.com/live" },
+  fxm: { name: "FXM", stationId: "70253", url: "https://abc.com/watch-live/d298ab7e-c6b1-4efa-ac6e-a52dceed92ee" },
+  "fxm-hulu": { channelSelector: "FXM", url: "https://www.hulu.com/live" },
+  "fxm-yttv": { channelSelector: "FXM", url: "https://tv.youtube.com/live" },
+  fxp: { name: "FX (Pacific)", stationId: "59814", url: "https://abc.com/watch-live/2cee3401-f63b-42d0-b32e-962fef610b9e" },
+  fxx: { name: "FXX", stationId: "66379", url: "https://abc.com/watch-live/49f4a471-8d36-4728-8457-ea65cbbc84ea" },
+  "fxx-hulu": { channelSelector: "FXX", url: "https://www.hulu.com/live" },
+  "fxx-yttv": { channelSelector: "FXX", url: "https://tv.youtube.com/live" },
+  fxxp: { name: "FXX (Pacific)", stationId: "82571", url: "https://abc.com/watch-live/e4c83395-62ed-4a49-829a-c55ab3c33e7d" },
   fyi: { name: "FYI", stationId: "58988", url: "https://play.fyi.tv/live" },
-
-  // Golf Channel has its own standalone site with no domain profile mapping.
-  golf: { name: "Golf", profile: "fullscreenApi", stationId: "61854", url: "https://www.golfchannel.com/watch/live" },
-
-  // Discovery and Warner Brothers Discovery family channels use the fullscreen API profile.
-  hgtv: { name: "HGTV", profile: "auto", stationId: "49788", url: "https://watch.foodnetwork.com/channel/hgtv" },
-
-  // A&E family channels use standard players that work with the default profile.
+  "fyi-hulu": { channelSelector: "FYI", url: "https://www.hulu.com/live" },
+  golf: { name: "Golf", stationId: "61854", url: "https://www.golfchannel.com/watch/live" },
+  "golf-hulu": { channelSelector: "Golf Channel", url: "https://www.hulu.com/live" },
+  "golf-usa": { channelSelector: "gc", url: "https://www.usanetwork.com/live" },
+  "golf-yttv": { channelSelector: "Golf Channel", url: "https://tv.youtube.com/live" },
+  hallmark: { name: "Hallmark", stationId: "66268", url: "https://www.watchhallmarktv.com/playback/item/live" },
+  "hallmark-hulu": { channelSelector: "Hallmark Channel", url: "https://www.hulu.com/live" },
+  "hallmark-yttv": { channelSelector: "Hallmark Channel", url: "https://tv.youtube.com/live" },
+  hallmarkfamily: { name: "Hallmark Family", stationId: "105723", url: "https://www.watchhallmarktv.com/playback/item/hdlive" },
+  "hallmarkfamily-yttv": { channelSelector: "Hallmark Family", url: "https://tv.youtube.com/live" },
+  hallmarkmystery: { name: "Hallmark Mystery", stationId: "46710", url: "https://www.watchhallmarktv.com/playback/item/hmmlive" },
+  "hallmarkmystery-hulu": { channelSelector: "Hallmark Mystery", url: "https://www.hulu.com/live" },
+  "hallmarkmystery-yttv": { channelSelector: "Hallmark Mystery", url: "https://tv.youtube.com/live" },
+  hbo: { channelSelector: "HBO", name: "HBO", stationId: "19548", url: "https://play.hbomax.com" },
+  "hbo-yttv": { channelSelector: "HBO East", url: "https://tv.youtube.com/live" },
+  hbocomedy: { channelSelector: "HBO Comedy", name: "HBO Comedy", stationId: "59839", url: "https://play.hbomax.com" },
+  "hbocomedy-yttv": { channelSelector: "HBO Comedy East", url: "https://tv.youtube.com/live" },
+  hbodrama: { channelSelector: "HBO Drama", name: "HBO Drama", stationId: "59363", url: "https://play.hbomax.com" },
+  "hbodrama-yttv": { channelSelector: "HBO Drama East", url: "https://tv.youtube.com/live" },
+  hbohits: { channelSelector: "HBO Hits", name: "HBO Hits", stationId: "59368", url: "https://play.hbomax.com" },
+  "hbohits-yttv": { channelSelector: "HBO Hits East", url: "https://tv.youtube.com/live" },
+  hbomovies: { channelSelector: "HBO Movies", name: "HBO Movies", stationId: "59845", url: "https://play.hbomax.com" },
+  "hbomovies-yttv": { channelSelector: "HBO Movies East", url: "https://tv.youtube.com/live" },
+  hgtv: { name: "HGTV", stationId: "49788", url: "https://watch.foodnetwork.com/channel/hgtv" },
+  "hgtv-hulu": { channelSelector: "HGTV", url: "https://www.hulu.com/live" },
+  "hgtv-sling": { channelSelector: "HGTV", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "hgtv-yttv": { channelSelector: "HGTV", url: "https://tv.youtube.com/live" },
   history: { name: "History", stationId: "14771", url: "https://play.history.com/live" },
-
-  // CNBC and CNN sites use standard players.
+  "history-hulu": { channelSelector: "The HISTORY Channel", url: "https://www.hulu.com/live" },
+  "history-sling": { channelSelector: "History", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
   hln: { name: "HLN", stationId: "64549", url: "https://www.cnn.com/videos/hln" },
-
-  // Discovery and Warner Brothers Discovery family channels use the fullscreen API profile.
-  id: { name: "Investigation Discovery", profile: "auto", stationId: "65342", url: "https://watch.foodnetwork.com/channel/investigation-discovery" },
-
-  // A&E family channels use standard players that work with the default profile.
+  "hln-hulu": { channelSelector: "HLN", url: "https://www.hulu.com/live" },
+  "hln-sling": { channelSelector: "HLN", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "hln-yttv": { channelSelector: "HLN", url: "https://tv.youtube.com/live" },
+  id: { name: "Investigation Discovery", stationId: "65342", url: "https://watch.foodnetwork.com/channel/investigation-discovery" },
+  "id-hulu": { channelSelector: "Investigation Discovery", url: "https://www.hulu.com/live" },
+  "id-sling": { channelSelector: "Investigation Discovery", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "id-yttv": { channelSelector: "ID", url: "https://tv.youtube.com/live" },
+  ifc: { channelSelector: "IFC", name: "IFC", stationId: "59444", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "ifc-yttv": { channelSelector: "IFC", url: "https://tv.youtube.com/live" },
+  indieplex: { channelSelector: "IndiePlex (East)", name: "IndiePlex", stationId: "65795", url: "https://www.hulu.com/live" },
+  indieplexp: { channelSelector: "IndiePlex (West)", name: "IndiePlex (Pacific)", stationId: "65796", url: "https://www.hulu.com/live" },
   lifetime: { name: "Lifetime", stationId: "60150", url: "https://play.mylifetime.com/live" },
-
-  // Discovery and Warner Brothers Discovery family channels use the fullscreen API profile.
-  magnolia: { name: "Magnolia Network", profile: "auto", stationId: "67375", url: "https://watch.foodnetwork.com/channel/magnolia-network-preview-atve-us" },
-
-  // Keyboard fullscreen sites with dynamic content loading requiring network idle wait.
-  msnow: { name: "MSNOW", profile: "auto", stationId: "64241", url: "https://www.ms.now/live" },
-  // msnow: { channelSelector: "image-23", name: "MSNOW", profile: "keyboardDynamicMultiVideo", stationId: "64241", url: "https://www.usanetwork.com/live" },
-
-  // National Geographic channels use keyboard fullscreen with dynamic content and multiple video elements.
-  natgeo: { name: "National Geographic", profile: "auto", stationId: "49438", url: "https://www.nationalgeographic.com/tv/watch-live/0826a9a3-3384-4bb5-8841-91f01cb0e3a7" },
-  natgeop: { name: "National Geographic (Pacific)", profile: "auto", stationId: "71601", url: "https://www.nationalgeographic.com/tv/watch-live/91456580-f32f-417c-8e1a-9f82640832a7" },
-  natgeowild: { name: "Nat Geo Wild", profile: "auto", stationId: "67331", url: "https://www.nationalgeographic.com/tv/watch-live/239b9590-583f-4955-a499-22e9eefff9cf" },
-
-  // Keyboard fullscreen sites with dynamic content loading. NBC station ID varies by local affiliate.
-  nbc: { name: "NBC", profile: "auto", url: "https://www.nbc.com/live?brand=nbc&callsign=nbc" },
-  nbcnews: { name: "NBC News Now", profile: "auto", stationId: "114174", url: "https://www.nbc.com/live?brand=nbc-news&callsign=nbcnews" },
-  nbcsbayarea: { name: "NBC Sports Bay Area", profile: "auto", stationId: "63138", url: "https://www.nbc.com/live?brand=rsn-bay-area&callsign=nbcsbayarea" },
-  nbcsboston: { name: "NBC Sports Boston", profile: "auto", stationId: "49198", url: "https://www.nbc.com/live?brand=rsn-boston&callsign=nbcsboston" },
-  nbcscalifornia: { name: "NBC Sports California", profile: "auto", stationId: "45540", url: "https://www.nbc.com/live?brand=rsn-california&callsign=nbcscalifornia" },
-  nbcschicago: { name: "NBC Sports Chicago", profile: "auto", stationId: "44905", url: "https://www.nbc.com/live?brand=rsn-chicago&callsign=nbcschicago" },
-  nbcsphiladelphia: { name: "NBC Sports Philadelphia", profile: "auto", stationId: "32571", url: "https://www.nbc.com/live?brand=rsn-philadelphia&callsign=nbcsphiladelphia" },
-  necn: { name: "NECN", profile: "auto", stationId: "66278", url: "https://www.nbc.com/live?brand=necn&callsign=necn" },
-
-  // Discovery and Warner Brothers Discovery family channels use the fullscreen API profile.
-  own: { name: "OWN", profile: "auto", stationId: "70388", url: "https://watch.foodnetwork.com/channel/own" },
-
-  // Multi-channel keyboard players requiring channel selection from the UI.
-  oxygen: { channelSelector: "Oxygen_East", name: "Oxygen", profile: "auto", stationId: "70522", url: "https://www.usanetwork.com/live" },
-  oxygenp: { channelSelector: "Oxygen_West", name: "Oxygen (Pacific)", profile: "auto", stationId: "74032", url: "https://www.usanetwork.com/live" },
-
-  // WTTW PBS uses a standard player.
+  "lifetime-hulu": { channelSelector: "Lifetime", url: "https://www.hulu.com/live" },
+  "lifetime-sling": { channelSelector: "Lifetime", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  lmn: { channelSelector: "LMN", name: "Lifetime Movie Network", stationId: "55887", url: "https://www.hulu.com/live" },
+  magnolia: { name: "Magnolia Network", stationId: "67375", url: "https://watch.foodnetwork.com/channel/magnolia-network-preview-atve-us" },
+  "magnolia-hulu": { channelSelector: "Magnolia Network", url: "https://www.hulu.com/live" },
+  "magnolia-yttv": { channelSelector: "Magnolia Network", url: "https://tv.youtube.com/live" },
+  mlb: { channelSelector: "MLB Network", name: "MLB Network", stationId: "62081", url: "https://www.hulu.com/live" },
+  movieplex: { channelSelector: "MoviePlex (East)", name: "MoviePlex", stationId: "83075", url: "https://www.hulu.com/live" },
+  movieplexp: { channelSelector: "MoviePlex (West)", name: "MoviePlex (Pacific)", stationId: "105963", url: "https://www.hulu.com/live" },
+  msnow: { name: "MS NOW", stationId: "64241", url: "https://www.ms.now/live" },
+  "msnow-hulu": { channelSelector: "MS NOW", url: "https://www.hulu.com/live" },
+  "msnow-sling": { channelSelector: "MS NOW", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "msnow-usa": { channelSelector: "image-23", url: "https://www.usanetwork.com/live" },
+  "msnow-yttv": { channelSelector: "MS NOW", url: "https://tv.youtube.com/live" },
+  mtv: { channelSelector: "MTV", name: "MTV", stationId: "60964", url: "https://www.hulu.com/live" },
+  "mtv-yttv": { channelSelector: "MTV", url: "https://tv.youtube.com/live" },
+  natgeo: { name: "National Geographic", stationId: "49438", url: "https://www.nationalgeographic.com/tv/watch-live/0826a9a3-3384-4bb5-8841-91f01cb0e3a7" },
+  "natgeo-hulu": { channelSelector: "National Geographic", url: "https://www.hulu.com/live" },
+  "natgeo-sling": { channelSelector: "National Geographic", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "natgeo-yttv": { channelSelector: "Nat Geo", url: "https://tv.youtube.com/live" },
+  natgeop: { name: "National Geographic (Pacific)", stationId: "71601", url: "https://www.nationalgeographic.com/tv/watch-live/91456580-f32f-417c-8e1a-9f82640832a7" },
+  natgeowild: { name: "Nat Geo Wild", stationId: "67331", url: "https://www.nationalgeographic.com/tv/watch-live/239b9590-583f-4955-a499-22e9eefff9cf" },
+  "natgeowild-hulu": { channelSelector: "Nat Geo WILD", url: "https://www.hulu.com/live" },
+  "natgeowild-yttv": { channelSelector: "Nat Geo WILD", url: "https://tv.youtube.com/live" },
+  nba: { name: "NBA TV", stationId: "45526", url: "https://www.nba.com/watch/nba-tv" },
+  "nba-yttv": { channelSelector: "NBA TV", url: "https://tv.youtube.com/live" },
+  nbc: { name: "NBC", url: "https://www.nbc.com/live?brand=nbc&callsign=nbc" },
+  "nbc-hulu": { channelSelector: "NBC", url: "https://www.hulu.com/live" },
+  "nbc-sling": { channelSelector: "NBC", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "nbc-yttv": { channelSelector: "NBC", url: "https://tv.youtube.com/live" },
+  nbcnews: { name: "NBC News Now", stationId: "114174", url: "https://www.nbc.com/live?brand=nbc-news&callsign=nbcnews" },
+  "nbcnews-hulu": { channelSelector: "NBC News NOW", url: "https://www.hulu.com/live" },
+  "nbcnews-sling": { channelSelector: "NBC News Now", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "nbcnews-yttv": { channelSelector: "NBC News NOW", url: "https://tv.youtube.com/live" },
+  nbcsbayarea: { name: "NBC Sports Bay Area", stationId: "63138", url: "https://www.nbc.com/live?brand=rsn-bay-area&callsign=nbcsbayarea" },
+  nbcsboston: { name: "NBC Sports Boston", stationId: "49198", url: "https://www.nbc.com/live?brand=rsn-boston&callsign=nbcsboston" },
+  nbcscalifornia: { name: "NBC Sports California", stationId: "45540", url: "https://www.nbc.com/live?brand=rsn-california&callsign=nbcscalifornia" },
+  nbcsphiladelphia: { name: "NBC Sports Philadelphia", stationId: "32571", url: "https://www.nbc.com/live?brand=rsn-philadelphia&callsign=nbcsphiladelphia" },
+  necn: { name: "NECN", stationId: "66278", url: "https://www.nbc.com/live?brand=necn&callsign=necn" },
+  nfl: { channelSelector: "NFL Network", name: "NFL Network", stationId: "45399", url: "https://www.hulu.com/live" },
+  "nfl-sling": { channelSelector: "NFL Network", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "nfl-yttv": { channelSelector: "NFL Network", url: "https://tv.youtube.com/live" },
+  own: { name: "OWN", stationId: "70388", url: "https://watch.foodnetwork.com/channel/own" },
+  "own-hulu": { channelSelector: "Oprah Winfrey Network", url: "https://www.hulu.com/live" },
+  "own-yttv": { channelSelector: "OWN", url: "https://tv.youtube.com/live" },
+  oxygen: { channelSelector: "Oxygen_East", name: "Oxygen", stationId: "70522", url: "https://www.usanetwork.com/live" },
+  "oxygen-hulu": { channelSelector: "Oxygen True Crime", url: "https://www.hulu.com/live" },
+  "oxygen-yttv": { channelSelector: "Oxygen True Crime", url: "https://tv.youtube.com/live" },
+  oxygenp: { channelSelector: "Oxygen_West", name: "Oxygen (Pacific)", stationId: "74032", url: "https://www.usanetwork.com/live" },
+  paramount: { channelSelector: "Paramount Network", name: "Paramount Network", stationId: "59186", url: "https://www.hulu.com/live" },
+  "paramount-yttv": { channelSelector: "Paramount", url: "https://tv.youtube.com/live" },
+  pbs: { channelSelector: "PBS", name: "PBS", url: "https://www.hulu.com/live" },
+  "pbs-yttv": { channelSelector: "PBS", url: "https://tv.youtube.com/live" },
   pbschicago: { name: "PBS Chicago (WTTW)", stationId: "30415", url: "https://www.wttw.com/wttw-live-stream" },
-
-  // PBS station Lakeshore uses an embedded player in iframe with no domain profile mapping.
-  pbslakeshore: { name: "PBS Lakeshore (WYIN)", profile: "embeddedPlayer", stationId: "49237", url: "https://video.lakeshorepbs.org/livestream" },
-
-  // Discovery and Warner Brothers Discovery family channels use the fullscreen API profile.
-  science: { name: "Science", profile: "auto", stationId: "57390", url: "https://watch.foodnetwork.com/channel/science" },
-
-  // Paramount Plus / Showtime uses a standard player.
+  "pbschicago-hulu": { channelSelector: "PBS", url: "https://www.hulu.com/live" },
+  pbslakeshore: { name: "PBS Lakeshore (WYIN)", stationId: "49237", url: "https://video.lakeshorepbs.org/livestream" },
+  "pbslakeshore-hulu": { channelSelector: "Lakeshore PBS", url: "https://www.hulu.com/live" },
+  retroplex: { channelSelector: "RetroPlex (East)", name: "RetroPlex", stationId: "65791", url: "https://www.hulu.com/live" },
+  retroplexp: { channelSelector: "RetroPlex (West)", name: "RetroPlex (Pacific)", stationId: "65793", url: "https://www.hulu.com/live" },
+  science: { name: "Science", stationId: "57390", url: "https://watch.foodnetwork.com/channel/science" },
   showtime: { name: "Showtime", stationId: "91620", url: "https://www.paramountplus.com/live-tv/stream/showtime-east" },
+  "showtime-yttv": { channelSelector: "Showtime East", url: "https://tv.youtube.com/live" },
   showtimep: { name: "Showtime (Pacific)", stationId: "91621", url: "https://www.paramountplus.com/live-tv/stream/showtime-west" },
-
-  // Multi-channel keyboard players requiring channel selection from the UI.
-  syfy: { channelSelector: "Syfy_East", name: "Syfy", profile: "auto", stationId: "58623", url: "https://www.usanetwork.com/live" },
-  syfyp: { channelSelector: "Syfy_West", name: "Syfy (Pacific)", profile: "auto", stationId: "65626", url: "https://www.usanetwork.com/live" },
-
-  // Discovery and Warner Brothers Discovery family channels use the fullscreen API profile.
-  tbs: { name: "TBS", profile: "auto", stationId: "58515", url: "https://www.tbs.com/watchtbs/east" },
-  tbsp: { name: "TBS (Pacific)", profile: "auto", stationId: "67890", url: "https://www.tbs.com/watchtbs/west" },
-  tlc: { name: "TLC", profile: "auto", stationId: "57391", url: "https://watch.foodnetwork.com/channel/tlc" },
-  tnt: { name: "TNT", profile: "auto", stationId: "42642", url: "https://www.tntdrama.com/watchtnt/east" },
-  tntp: { name: "TNT (Pacific)", profile: "auto", stationId: "61340", url: "https://www.tntdrama.com/watchtnt/west" },
-  travel: { name: "Travel", profile: "auto", stationId: "59303", url: "https://watch.foodnetwork.com/channel/travel-channel" },
-
-  // truTV has no domain profile mapping for trutv.com.
-  trutv: { name: "truTV", profile: "fullscreenApi", stationId: "64490", url: "https://www.trutv.com/watchtrutv/east" },
-
-  // Multi-channel keyboard players requiring channel selection from the UI.
-  usa: { channelSelector: "USA_East", name: "USA Network", profile: "auto", stationId: "58452", url: "https://www.usanetwork.com/live" },
-  usap: { channelSelector: "USA_West", name: "USA Network (Pacific)", profile: "auto", stationId: "74030", url: "https://www.usanetwork.com/live" },
-
-  // Discovery and Warner Brothers Discovery family channels use the fullscreen API profile.
-  vh1: { name: "VH1", profile: "auto", stationId: "60046", url: "https://www.vh1.com/live-tv" }
+  smithsonian: { channelSelector: "Smithsonian Channel", name: "Smithsonian Channel", stationId: "58532", url: "https://www.hulu.com/live" },
+  "smithsonian-yttv": { channelSelector: "Smithsonian Channel", url: "https://tv.youtube.com/live" },
+  starz: { name: "Starz", stationId: "34941", url: "https://www.starz.com/us/en/play/2" },
+  "starz-hulu": { channelSelector: "STARZ (East)", url: "https://www.hulu.com/live" },
+  starzcinema: { channelSelector: "STARZ Cinema (East)", name: "Starz Cinema", stationId: "67236", url: "https://www.hulu.com/live" },
+  starzcinemap: { channelSelector: "STARZ Cinema (West)", name: "Starz Cinema (Pacific)", stationId: "67365", url: "https://www.hulu.com/live" },
+  starzcomedy: { channelSelector: "STARZ Comedy (East)", name: "Starz Comedy", stationId: "57569", url: "https://www.hulu.com/live" },
+  starzcomedyp: { channelSelector: "STARZ Comedy (West)", name: "Starz Comedy (Pacific)", stationId: "57575", url: "https://www.hulu.com/live" },
+  starzedge: { channelSelector: "STARZ Edge (East)", name: "Starz Edge", stationId: "57573", url: "https://www.hulu.com/live" },
+  starzedgep: { channelSelector: "STARZ Edge (West)", name: "Starz Edge (Pacific)", stationId: "57578", url: "https://www.hulu.com/live" },
+  starzencore: { channelSelector: "STARZ Encore (East)", name: "Starz Encore", stationId: "36225", url: "https://www.hulu.com/live" },
+  starzencoreaction: { channelSelector: "STARZ Encore Action (East)", name: "Starz Encore Action", stationId: "72015", url: "https://www.hulu.com/live" },
+  starzencoreactionp: { channelSelector: "STARZ Encore Action (West)", name: "Starz Encore Action (Pacific)", stationId: "103833", url: "https://www.hulu.com/live" },
+  starzencoreblack: { channelSelector: "STARZ Encore Black (East)", name: "Starz Encore Black", stationId: "72014", url: "https://www.hulu.com/live" },
+  starzencoreblackp: { channelSelector: "STARZ Encore Black (West)", name: "Starz Encore Black (Pacific)", stationId: "103834", url: "https://www.hulu.com/live" },
+  starzencoreclassic: { channelSelector: "STARZ Encore Classic (East)", name: "Starz Encore Classic", stationId: "83404", url: "https://www.hulu.com/live" },
+  starzencoreclassicp: { channelSelector: "STARZ Encore Classic (West)", name: "Starz Encore Classic (Pacific)", stationId: "97233", url: "https://www.hulu.com/live" },
+  starzencoreespanol: { channelSelector: "STARZ Encore Español (East)", name: "Starz Encore Español", stationId: "72016", url: "https://www.hulu.com/live" },
+  starzencoreespanolp: { channelSelector: "STARZ Encore Español (West)", name: "Starz Encore Español (Pacific)", stationId: "104730", url: "https://www.hulu.com/live" },
+  starzencorefamily: { channelSelector: "STARZ Encore Family (East)", name: "Starz Encore Family", stationId: "14886", url: "https://www.hulu.com/live" },
+  starzencorefamilyp: { channelSelector: "STARZ Encore Family (West)", name: "Starz Encore Family (Pacific)", stationId: "103829", url: "https://www.hulu.com/live" },
+  starzencorep: { channelSelector: "STARZ Encore (West)", name: "Starz Encore (Pacific)", stationId: "67237", url: "https://www.hulu.com/live" },
+  starzencoresuspense: { channelSelector: "STARZ Encore Suspense (East)", name: "Starz Encore Suspense", stationId: "83076", url: "https://www.hulu.com/live" },
+  starzencoresuspensep: { channelSelector: "STARZ Encore Suspense (West)", name: "Starz Encore Suspense (Pacific)", stationId: "103836", url: "https://www.hulu.com/live" },
+  starzencorewesterns: { channelSelector: "STARZ Encore Westerns (East)", name: "Starz Encore Westerns", stationId: "14765", url: "https://www.hulu.com/live" },
+  starzencorewesternsp: { channelSelector: "STARZ Encore Westerns (West)", name: "Starz Encore Westerns (Pacific)", stationId: "103856", url: "https://www.hulu.com/live" },
+  starzinblack: { channelSelector: "STARZ in Black (East)", name: "Starz in Black", stationId: "67235", url: "https://www.hulu.com/live" },
+  starzinblackp: { channelSelector: "STARZ in Black (West)", name: "Starz in Black (Pacific)", stationId: "67367", url: "https://www.hulu.com/live" },
+  starzkids: { channelSelector: "STARZ Kids (East)", name: "Starz Kids", stationId: "57581", url: "https://www.hulu.com/live" },
+  starzkidsp: { channelSelector: "STARZ Kids (West)", name: "Starz Kids (Pacific)", stationId: "57583", url: "https://www.hulu.com/live" },
+  starzp: { channelSelector: "STARZ (West)", name: "Starz (Pacific)", stationId: "34949", url: "https://www.hulu.com/live" },
+  sundancetv: { channelSelector: "SundanceTV", name: "SundanceTV", stationId: "71280", url: "https://tv.youtube.com/live" },
+  syfy: { channelSelector: "Syfy_East", name: "Syfy", stationId: "58623", url: "https://www.usanetwork.com/live" },
+  "syfy-hulu": { channelSelector: "SYFY", url: "https://www.hulu.com/live" },
+  "syfy-sling": { channelSelector: "SYFY", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "syfy-yttv": { channelSelector: "SYFY", url: "https://tv.youtube.com/live" },
+  syfyp: { channelSelector: "Syfy_West", name: "Syfy (Pacific)", stationId: "65626", url: "https://www.usanetwork.com/live" },
+  tbs: { name: "TBS", stationId: "58515", url: "https://www.tbs.com/watchtbs/east" },
+  "tbs-hulu": { channelSelector: "TBS (East)", url: "https://www.hulu.com/live" },
+  "tbs-sling": { channelSelector: "TBS", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "tbs-yttv": { channelSelector: "TBS", url: "https://tv.youtube.com/live" },
+  tbsp: { name: "TBS (Pacific)", stationId: "67890", url: "https://www.tbs.com/watchtbs/west" },
+  "tbsp-hulu": { channelSelector: "TBS (West)", url: "https://www.hulu.com/live" },
+  tcm: { channelSelector: "TCM (East)", name: "TCM", stationId: "64312", url: "https://www.hulu.com/live" },
+  "tcm-yttv": { channelSelector: "Turner Classic Movies", url: "https://tv.youtube.com/live" },
+  tcmp: { channelSelector: "TCM (West)", name: "TCM (Pacific)", stationId: "64312", tvgShift: 3, url: "https://www.hulu.com/live" },
+  tlc: { name: "TLC", stationId: "57391", url: "https://watch.foodnetwork.com/channel/tlc" },
+  "tlc-hulu": { channelSelector: "TLC", url: "https://www.hulu.com/live" },
+  "tlc-sling": { channelSelector: "TLC", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "tlc-yttv": { channelSelector: "TLC", url: "https://tv.youtube.com/live" },
+  tnt: { name: "TNT", stationId: "42642", url: "https://www.tntdrama.com/watchtnt/east" },
+  "tnt-hulu": { channelSelector: "TNT (East)", url: "https://www.hulu.com/live" },
+  "tnt-sling": { channelSelector: "TNT", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "tnt-yttv": { channelSelector: "TNT", url: "https://tv.youtube.com/live" },
+  tntp: { name: "TNT (Pacific)", stationId: "61340", url: "https://www.tntdrama.com/watchtnt/west" },
+  "tntp-hulu": { channelSelector: "TNT (West)", url: "https://www.hulu.com/live" },
+  travel: { name: "Travel", stationId: "59303", url: "https://watch.foodnetwork.com/channel/travel-channel" },
+  "travel-hulu": { channelSelector: "Travel Channel", url: "https://www.hulu.com/live" },
+  "travel-sling": { channelSelector: "Travel Channel", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "travel-yttv": { channelSelector: "Travel Channel", url: "https://tv.youtube.com/live" },
+  trutv: { name: "truTV", stationId: "64490", url: "https://www.trutv.com/watchtrutv/east" },
+  "trutv-hulu": { channelSelector: "truTV (East)", url: "https://www.hulu.com/live" },
+  "trutv-sling": { channelSelector: "truTV", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "trutv-yttv": { channelSelector: "truTV", url: "https://tv.youtube.com/live" },
+  trutvp: { name: "truTV (Pacific)", stationId: "65717", url: "https://www.trutv.com/watchtrutv/east" },
+  "trutvp-hulu": { channelSelector: "truTV (West)", url: "https://www.hulu.com/live" },
+  usa: { channelSelector: "USA_East", name: "USA Network", stationId: "58452", url: "https://www.usanetwork.com/live" },
+  "usa-hulu": { channelSelector: "USA", url: "https://www.hulu.com/live" },
+  "usa-sling": { channelSelector: "USA", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  "usa-yttv": { channelSelector: "USA", url: "https://tv.youtube.com/live" },
+  usap: { channelSelector: "USA_West", name: "USA Network (Pacific)", stationId: "74030", url: "https://www.usanetwork.com/live" },
+  vh1: { name: "VH1", stationId: "60046", url: "https://www.vh1.com/live-tv" },
+  "vh1-hulu": { channelSelector: "VH1", url: "https://www.hulu.com/live" },
+  "vh1-yttv": { channelSelector: "VH1", url: "https://tv.youtube.com/live" },
+  vice: { channelSelector: "Vice", name: "Vice", stationId: "65732", url: "https://www.hulu.com/live" },
+  "vice-sling": { channelSelector: "VICE", url: "https://watch.sling.com/dashboard/grid_guide/grid_guide_a_z" },
+  weather: { channelSelector: "The Weather Channel", name: "The Weather Channel", stationId: "58812", url: "https://www.hulu.com/live" },
+  "weather-yttv": { channelSelector: "The Weather Channel", url: "https://tv.youtube.com/live" },
+  wetv: { channelSelector: "WE tv", name: "WE tv", stationId: "59296", url: "https://tv.youtube.com/live" }
 };
 /* eslint-enable @stylistic/max-len */
-
-/**
- * Gets a channel by name.
- * @param name - The channel key name.
- * @returns The channel configuration or undefined if not found.
- */
-export function getChannel(name: string): Channel | undefined {
-
-  return CHANNELS[name];
-}
-
-/**
- * Returns the total number of configured channels.
- * @returns The channel count.
- */
-export function getChannelCount(): number {
-
-  return Object.keys(CHANNELS).length;
-}
-
-/**
- * Returns all channel names sorted alphabetically.
- * @returns Array of channel key names.
- */
-export function getChannelNames(): string[] {
-
-  return Object.keys(CHANNELS).sort();
-}
 
 // Re-export CHANNELS as PREDEFINED_CHANNELS for use in userChannels.ts where the distinction between predefined and user channels is important.
 export { CHANNELS as PREDEFINED_CHANNELS };

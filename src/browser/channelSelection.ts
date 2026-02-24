@@ -1,39 +1,129 @@
 /* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * channelSelection.ts: Channel selection strategies for multi-channel streaming sites.
+ * channelSelection.ts: Channel selection coordinator for multi-channel streaming sites.
  */
-import type { ChannelSelectorResult, ClickTarget, ResolvedSiteProfile } from "../types/index.js";
-import { LOG, delay, evaluateWithAbort } from "../utils/index.js";
+import type { ChannelSelectionProfile, ChannelSelectorResult, ChannelStrategyEntry, ClickTarget, Nullable, ProviderModule, ResolvedSiteProfile } from "../types/index.js";
+import { LOG, delay } from "../utils/index.js";
+import { CHANNELS } from "../channels/index.js";
 import { CONFIG } from "../config/index.js";
 import type { Page } from "puppeteer-core";
+import { foxProvider } from "./tuning/fox.js";
+import { hboProvider } from "./tuning/hbo.js";
+import { huluProvider } from "./tuning/hulu.js";
+import { isChannelSelectionProfile } from "../types/index.js";
+import { slingProvider } from "./tuning/sling.js";
+import { thumbnailRowStrategy } from "./tuning/thumbnailRow.js";
+import { tileClickStrategy } from "./tuning/tileClick.js";
+import { yttvProvider } from "./tuning/youtubeTv.js";
 
-/*
- * CHANNEL SELECTION SYSTEM
+/* Multi-channel streaming sites (like USA Network) present multiple channels on a single page, with a program guide for each channel. Users must select which
+ * channel they want to watch by clicking on a show in the guide. This module coordinates the dispatch to per-provider strategy functions in the tuning/ directory.
  *
- * Multi-channel streaming sites (like USA Network) present multiple channels on a single page, with a program guide for each channel. Users must select which
- * channel they want to watch by clicking on a show in the guide. This module provides a strategy-based system for automating that channel selection.
+ * Each provider tuning file exports a single ProviderModule object that bundles identity metadata (slug, label, guideUrl), the tuning strategy, and a
+ * discoverChannels implementation. The coordinator builds its strategy dispatch lookup from provider modules at evaluation time. Generic strategies
+ * (thumbnailRow, tileClick) remain bare ChannelStrategyEntry objects — they are site-specific interaction patterns, not provider-level registrations.
  *
- * The strategy pattern allows different sites to have different selection mechanisms:
- * - thumbnailRow: Find channel by matching image URL slug, click adjacent show entry on the same row (USA Network)
- * - tileClick: Find channel tile by matching image URL slug, click tile, then click play button on modal (Disney+ live)
- *
- * Each strategy is a self-contained function that takes the page and channel slug, and returns a success/failure result. The main selectChannel() function
- * delegates to the appropriate strategy based on the profile configuration.
+ * Strategy files may import scrollAndClick(), normalizeChannelName(), and resolveMatchSelector() from this coordinator — the circular import is safe because
+ * all cross-module calls happen inside async functions long after module evaluation completes.
  */
 
-/*
- * HELPER FUNCTIONS
+/* Adding a new channel selection provider:
  *
- * These utilities are shared across channel selection strategies. They handle common operations like finding elements, scrolling, and clicking.
+ * 1. Create a new file in tuning/ implementing the strategy function with the ChannelStrategyHandler signature.
+ * 2. Export a single ProviderModule object from the file. Set the required fields:
+ *    - slug, label, guideUrl: Identity metadata for API endpoints and logging.
+ *    - strategyName: The ChannelSelectionStrategy union value that site profiles reference.
+ *    - strategy: A ChannelStrategyEntry with at minimum an execute hook. Also set clearCache, resolveDirectUrl, and invalidateDirectUrl as needed.
+ *    - discoverChannels: Reads the provider's guide for all available channels, returning DiscoveredChannel[].
+ * 3. Import the provider here and add it to the providerModules array.
+ * 4. Add the strategy name to the ChannelSelectionStrategy union type in types/index.ts.
+ * 5. Add a site profile entry in config/sites.ts that references the new strategy name.
+ *
+ * The coordinator handles all cross-cutting concerns (dispatch, cache clearing, direct URL resolution, matchSelector polling) through the ChannelStrategyEntry
+ * interface. Strategy files may import scrollAndClick(), normalizeChannelName(), resolveMatchSelector(), and logAvailableChannels() from this module for shared
+ * utilities.
  */
+
+// Provider module registry. The primary registry for all provider-level operations. Each entry bundles identity metadata, tuning strategy, and channel discovery.
+// Future capabilities become additional methods on ProviderModule — no new registries needed.
+const providerModules: readonly ProviderModule[] = [ foxProvider, hboProvider, huluProvider, slingProvider, yttvProvider ];
+
+// Strategy dispatch registry. Derived from provider modules (keyed by strategyName) plus generic strategies that are not provider-level registrations.
+const strategies: Record<string, ChannelStrategyEntry> = Object.fromEntries([
+  ...providerModules.map((p) => [ p.strategyName, p.strategy ]),
+  [ "thumbnailRow", thumbnailRowStrategy ],
+  [ "tileClick", tileClickStrategy ]
+]) as Record<string, ChannelStrategyEntry>;
 
 /**
- * Scrolls an element into view and clicks it at the specified coordinates. Includes delays to allow for animations and content loading.
+ * Returns a direct watch URL for the channel specified in the profile, if one can be resolved. Looks up the strategy entry's resolveDirectUrl hook and calls it
+ * with the channelSelector and page. Returns null if the strategy has no resolver, the profile has no channelSelector, or the resolver returns null.
+ * @param profile - The resolved site profile.
+ * @param page - The Puppeteer page object, passed through to the strategy's resolver for response interception setup or API calls.
+ * @returns The direct watch URL or null.
+ */
+export async function resolveDirectUrl(profile: ResolvedSiteProfile, page: Page): Promise<Nullable<string>> {
+
+  const { channelSelection, channelSelector } = profile;
+
+  if(!channelSelector) {
+
+    return null;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+  return await strategies[channelSelection.strategy]?.resolveDirectUrl?.(channelSelector, page) ?? null;
+}
+
+/**
+ * Invalidates the cached direct watch URL for the channel specified in the profile. Looks up the strategy entry's invalidateDirectUrl hook and calls it with
+ * the channelSelector. No-op if the strategy has no invalidator or the profile has no channelSelector.
+ * @param profile - The resolved site profile.
+ */
+export function invalidateDirectUrl(profile: ResolvedSiteProfile): void {
+
+  const { channelSelection, channelSelector } = profile;
+
+  if(!channelSelector) {
+
+    return;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+  strategies[channelSelection.strategy]?.invalidateDirectUrl?.(channelSelector);
+}
+
+/**
+ * Clears all channel selection caches. Called by handleBrowserDisconnect() in browser/index.ts when the browser restarts, since cached state (guide row positions,
+ * discovered page URLs, watch URLs) may be stale in a new browser session.
+ */
+export function clearChannelSelectionCaches(): void {
+
+  for(const entry of Object.values(strategies)) {
+
+    entry.clearCache?.();
+  }
+}
+
+/**
+ * Looks up a provider module by its URL slug. Returns undefined if no provider matches.
+ * @param slug - The provider slug (e.g., "yttv", "hulu", "sling").
+ * @returns The matching provider module or undefined.
+ */
+export function getProviderBySlug(slug: string): ProviderModule | undefined {
+
+  return providerModules.find((p) => p.slug === slug);
+}
+
+/**
+ * Clicks at the specified coordinates after a brief settle delay. The delay allows scroll animations and lazy-loaded content to finish before the click fires.
+ * Callers are responsible for scrolling the target element into view (typically via scrollIntoView inside a page.evaluate call) before invoking this function.
+ * Exported for use by tuning strategy files (thumbnailRow, tileClick, hulu).
  * @param page - The Puppeteer page object.
  * @param target - The x/y coordinates to click.
  * @returns True if the click was executed.
  */
-async function scrollAndClick(page: Page, target: ClickTarget): Promise<boolean> {
+export async function scrollAndClick(page: Page, target: ClickTarget): Promise<boolean> {
 
   // Brief delay after scrolling for any animations or lazy-loaded content to settle.
   await delay(200);
@@ -44,307 +134,116 @@ async function scrollAndClick(page: Page, target: ClickTarget): Promise<boolean>
   return true;
 }
 
-/*
- * CHANNEL SELECTION STRATEGIES
- *
- * Each strategy implements a different approach to finding and selecting channels. Strategies are self-contained functions that can be tested independently.
- */
+// Normalizes a channel name for case-insensitive, whitespace-tolerant comparison. Trims leading and trailing whitespace, collapses internal whitespace sequences
+// (including non-breaking spaces, tabs, and other Unicode whitespace matched by \s) into a single regular space, and lowercases. This handles data-testid values
+// with trailing spaces, double spaces, or non-breaking space characters that would otherwise cause exact match failures.
+// Exported for use by tuning strategy files (hulu, sling).
+export function normalizeChannelName(name: string): string {
 
-/**
- * Thumbnail row strategy: finds a channel by matching the slug in thumbnail image URLs, then clicks an adjacent clickable element on the same row. This strategy
- * works for sites like USA Network where channels are displayed as rows with a thumbnail on the left and program entries to the right.
- *
- * The selection process:
- * 1. Search all images on the page for one whose src URL contains the channel slug
- * 2. Verify the image has dimensions (is rendered and visible)
- * 3. Walk up the DOM to find a container wide enough to hold both thumbnail and guide entries
- * 4. Search for clickable elements (links, buttons, cards) to the right of the thumbnail on the same row
- * 5. Fall back to divs with cursor:pointer if no semantic clickables found
- * 6. Click the found element to switch to the channel
- * @param page - The Puppeteer page object.
- * @param channelSlug - The literal string to match in thumbnail image URLs.
- * @returns Result object with success status and optional failure reason.
- */
-async function thumbnailRowStrategy(page: Page, channelSlug: string): Promise<ChannelSelectorResult> {
+  return name.trim().replace(/\s+/g, " ").toLowerCase();
+}
 
-  // Find clickable element by evaluating DOM. The logic walks through the page looking for channel thumbnail images, then finds clickable show entries on the
-  // same row.
-  const clickTarget = await evaluateWithAbort(page, (slug: string): ClickTarget | null => {
+// Resolves the CSS selector for finding a channel element. Interpolates the {channel} placeholder in the profile's matchSelector template with the channelSelector
+// value. When matchSelector is not configured, falls back to image URL matching for backward compatibility.
+// Exported for use by tuning strategy files (tileClick, thumbnailRow).
+export function resolveMatchSelector(profile: ChannelSelectionProfile): string {
 
-    const images = document.querySelectorAll("img");
+  const template = profile.channelSelection.matchSelector;
 
-    for(const img of Array.from(images)) {
+  if(template) {
 
-      // Channel thumbnails have URLs containing the channel slug pattern. Match against the src URL.
-      if(img.src && img.src.includes(slug)) {
-
-        const imgRect = img.getBoundingClientRect();
-
-        // Verify the image has dimensions (is actually rendered and visible).
-        if((imgRect.width > 0) && (imgRect.height > 0)) {
-
-          // Found the channel thumbnail. Now walk up the DOM tree to find a container that holds both the thumbnail and the guide entries for this row.
-          let rowContainer: HTMLElement | null = img.parentElement;
-
-          while(rowContainer && (rowContainer !== document.body)) {
-
-            const containerRect = rowContainer.getBoundingClientRect();
-
-            // Look for a container significantly wider than the thumbnail (indicating it contains more than just the image). The factor of 2 is a heuristic
-            // that works for typical channel guide layouts.
-            if(containerRect.width > (imgRect.width * 2)) {
-
-              // This container is wide enough to contain guide entries. Search for clickable elements (show cards) to the right of the thumbnail.
-              const clickables = rowContainer.querySelectorAll(
-                "a, button, [role=\"button\"], [onclick], [class*=\"card\"], [class*=\"program\"], [class*=\"show\"], [class*=\"episode\"]"
-              );
-
-              const imgCenterY = imgRect.y + (imgRect.height / 2);
-
-              for(const clickable of Array.from(clickables)) {
-
-                const clickRect = clickable.getBoundingClientRect();
-                const clickCenterY = clickRect.y + (clickRect.height / 2);
-
-                // The guide entry must meet these criteria:
-                // - To the right of the thumbnail (with small tolerance for overlapping borders)
-                // - Has dimensions (is visible)
-                // - On the same row (vertical center within thumbnail height)
-                const isRightOfThumbnail = clickRect.x > (imgRect.x + imgRect.width - 10);
-                const hasDimensions = (clickRect.width > 0) && (clickRect.height > 0);
-                const isSameRow = Math.abs(clickCenterY - imgCenterY) < imgRect.height;
-
-                if(isRightOfThumbnail && hasDimensions && isSameRow) {
-
-                  // Found a suitable click target. Scroll it into view and return its center coordinates.
-                  (clickable as HTMLElement).scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
-
-                  const newRect = clickable.getBoundingClientRect();
-
-                  return { x: newRect.x + (newRect.width / 2), y: newRect.y + (newRect.height / 2) };
-                }
-              }
-
-              // Fallback: if no semantically clickable elements found, look for divs with cursor: pointer styling. These are often custom-styled click
-              // handlers.
-              const allDivs = rowContainer.querySelectorAll("div");
-
-              for(const div of Array.from(allDivs)) {
-
-                const divRect = div.getBoundingClientRect();
-                const divCenterY = divRect.y + (divRect.height / 2);
-                const style = window.getComputedStyle(div);
-
-                const isRightOfThumbnail = divRect.x > (imgRect.x + imgRect.width - 10);
-                const hasDimensions = (divRect.width > 20) && (divRect.height > 20);
-                const isClickable = style.cursor === "pointer";
-                const isSameRow = Math.abs(divCenterY - imgCenterY) < imgRect.height;
-
-                if(isRightOfThumbnail && hasDimensions && isClickable && isSameRow) {
-
-                  div.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
-
-                  const newRect = div.getBoundingClientRect();
-
-                  return { x: newRect.x + (newRect.width / 2), y: newRect.y + (newRect.height / 2) };
-                }
-              }
-            }
-
-            rowContainer = rowContainer.parentElement;
-          }
-
-          // Ultimate fallback: click a fixed offset to the right of the thumbnail. This is a last resort if the guide structure doesn't match our
-          // expectations.
-          img.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
-
-          const newImgRect = img.getBoundingClientRect();
-
-          return { x: newImgRect.x + newImgRect.width + 50, y: newImgRect.y + (newImgRect.height / 2) };
-        }
-      }
-    }
-
-    // Channel thumbnail not found in any images.
-    return null;
-  }, [channelSlug]);
-
-  if(clickTarget) {
-
-    await scrollAndClick(page, clickTarget);
-
-    // Poll for the video readyState to drop below 3, indicating the channel switch has started loading new content. This replaces a fixed post-click delay with
-    // early exit. If no video exists yet or readyState never drops (channel already selected), the timeout expires harmlessly and waitForVideoReady() handles the
-    // rest.
-    try {
-
-      await page.waitForFunction(
-        (): boolean => {
-
-          const v = document.querySelector("video");
-
-          return !v || (v.readyState < 3);
-        },
-        { timeout: CONFIG.playback.channelSwitchDelay }
-      );
-    } catch {
-
-      // Timeout — readyState never dropped. Proceed normally.
-    }
-
-    return { success: true };
+    return template.replaceAll("{channel}", profile.channelSelector);
   }
 
-  return { reason: "Channel thumbnail not found in page images.", success: false };
+  // Default to image URL slug matching for backward compatibility with profiles that don't specify matchSelector.
+  return "img[src*=\"" + profile.channelSelector + "\"]";
 }
 
 /**
- * Tile click strategy: finds a channel by matching the slug in tile image URLs, clicks the tile to open an entity modal, then clicks a "watch live" play button on
- * the modal. This strategy works for sites like Disney+ where live channels are displayed as tiles in a horizontal shelf, and selecting one opens a modal with a
- * play button to start the live stream.
- *
- * The selection process:
- * 1. Search all images on the page for one whose src URL contains the channel slug
- * 2. Walk up the DOM to find the nearest clickable ancestor (the tile container)
- * 3. Scroll the tile into view and click it
- * 4. Wait for the play button to appear on the resulting modal
- * 5. Click the play button to start live playback
- * @param page - The Puppeteer page object.
- * @param channelSlug - The literal string to match in tile image URLs.
- * @returns Result object with success status and optional failure reason.
+ * Logs available channel names from a provider's guide grid when channel selection fails. Produces an actionable log message listing channel names that users can
+ * use as `channelSelector` values in user-defined channels. When `presetSuffix` is provided, channels already covered by built-in preset definitions are filtered
+ * out so users see only channels that require manual configuration. When omitted (small channel sets like Fox or HBO), all channels are logged unfiltered.
+ * @param options - Diagnostic dump configuration.
+ * @param options.additionalKnownNames - Extra names to exclude from the filtered list (e.g., CHANNEL_ALTERNATES values for YTTV).
+ * @param options.availableChannels - Sorted list of channel names discovered in the guide grid.
+ * @param options.channelName - The channelSelector value that failed to match, for the log message.
+ * @param options.guideUrl - The URL of the provider's guide page, included in the log message so users know what to set as the channel URL.
+ * @param options.presetSuffix - Key suffix to filter preset channels (e.g., "-yttv", "-hulu"). Omit for small unfiltered channel sets.
+ * @param options.providerName - Human-readable provider name for the log message (e.g., "YouTube TV", "Hulu").
  */
-async function tileClickStrategy(page: Page, channelSlug: string): Promise<ChannelSelectorResult> {
+export function logAvailableChannels(options: {
+  additionalKnownNames?: string[];
+  availableChannels: string[];
+  channelName: string;
+  guideUrl: string;
+  presetSuffix?: string;
+  providerName: string;
+}): void {
 
-  // Step 1: Find the channel tile by matching the slug in a descendant image's src URL. Live channels are displayed as tiles in a horizontal shelf, each containing
-  // an image with the network name in the URL label parameter (e.g., "poster_linear_espn_none"). We match the image, then walk up the DOM to find the nearest
-  // clickable ancestor that represents the entire tile.
-  const tileTarget = await evaluateWithAbort(page, (slug: string): ClickTarget | null => {
+  const { additionalKnownNames, availableChannels, channelName, guideUrl, presetSuffix, providerName } = options;
 
-    const images = document.querySelectorAll("img");
+  if(availableChannels.length === 0) {
 
-    for(const img of Array.from(images)) {
+    return;
+  }
 
-      if(img.src && img.src.includes(slug)) {
+  let filteredChannels: string[];
+  let countLabel: string;
 
-        // Walk up the DOM to find the nearest clickable ancestor wrapping the tile. Check for semantic clickable elements (<a>, <button>, role="button") and
-        // elements with explicit click handlers first. Track cursor:pointer elements as a fallback for sites using custom click handlers without semantic markup.
-        let ancestor: HTMLElement | null = img.parentElement;
-        let pointerFallback: HTMLElement | null = null;
+  if(presetSuffix) {
 
-        while(ancestor && (ancestor !== document.body)) {
+    // Collect all channelSelector values from preset channels with this suffix, lowercased for case-insensitive comparison.
+    const knownSelectors: string[] = Object.entries(CHANNELS)
+      .filter(([key]) => key.endsWith(presetSuffix))
+      .map(([ , ch ]) => (ch.channelSelector ?? "").toLowerCase())
+      .filter((s) => s.length > 0);
 
-          const tag = ancestor.tagName;
+    // Include additional known names (e.g., CHANNEL_ALTERNATES values for YTTV) so those are also filtered out.
+    if(additionalKnownNames) {
 
-          // Semantic clickable elements are the most reliable indicators of an interactive tile container.
-          if((tag === "A") || (tag === "BUTTON") || (ancestor.getAttribute("role") === "button") || ancestor.hasAttribute("onclick")) {
+      for(const name of additionalKnownNames) {
 
-            ancestor.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
-
-            const rect = ancestor.getBoundingClientRect();
-
-            if((rect.width > 0) && (rect.height > 0)) {
-
-              return { x: rect.x + (rect.width / 2), y: rect.y + (rect.height / 2) };
-            }
-          }
-
-          // Track the nearest cursor:pointer ancestor with reasonable dimensions as a fallback.
-          if(!pointerFallback) {
-
-            const rect = ancestor.getBoundingClientRect();
-
-            if((rect.width > 20) && (rect.height > 20) && (window.getComputedStyle(ancestor).cursor === "pointer")) {
-
-              pointerFallback = ancestor;
-            }
-          }
-
-          ancestor = ancestor.parentElement;
-        }
-
-        // Fallback: use cursor:pointer ancestor if no semantic clickable was found above.
-        if(pointerFallback) {
-
-          pointerFallback.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
-
-          const rect = pointerFallback.getBoundingClientRect();
-
-          if((rect.width > 0) && (rect.height > 0)) {
-
-            return { x: rect.x + (rect.width / 2), y: rect.y + (rect.height / 2) };
-          }
-        }
+        knownSelectors.push(name.toLowerCase());
       }
     }
 
-    return null;
-  }, [channelSlug]);
+    // Filter to channels not matched by any known selector. A channel is "covered" if a preset would find it via exact match (with parenthetical suffix stripped)
+    // or prefix+digit match. This mirrors the strategy's own matching tiers so users see only channels that genuinely need manual configuration.
+    filteredChannels = availableChannels.filter((name) => {
 
-  if(!tileTarget) {
+      const lower = name.toLowerCase();
+      const stripped = lower.replace(/ \(.*\)$/, "");
 
-    return { reason: "Channel tile not found in page images.", success: false };
+      return !knownSelectors.some((sel) => {
+
+        return (stripped === sel) ||
+          (lower.startsWith(sel + " ") && (lower.length > sel.length + 1) && (lower.charCodeAt(sel.length + 1) >= 48) && (lower.charCodeAt(sel.length + 1) <= 57));
+      });
+    });
+
+    countLabel = "uncovered (" + String(filteredChannels.length) + " of " + String(availableChannels.length) + ")";
+  } else {
+
+    // No preset suffix — log all available channels unfiltered. Used for small channel sets (Fox, HBO) where the full list is actionable without filtering.
+    filteredChannels = availableChannels;
+    countLabel = String(filteredChannels.length);
   }
 
-  // Click the channel tile to open the entity modal.
-  await scrollAndClick(page, tileTarget);
+  if(filteredChannels.length === 0) {
 
-  // Step 2: Wait for the "WATCH LIVE" button to appear on the entity modal. The button is an <a> element with a specific data-testid attribute. After clicking the
-  // tile, the site performs a SPA navigation that renders a modal with playback options.
-  const playButtonSelector = "[data-testid=\"live-modal-watch-live-action-button\"]";
-
-  try {
-
-    await page.waitForSelector(playButtonSelector, { timeout: CONFIG.streaming.videoTimeout });
-  } catch {
-
-    return { reason: "Play button did not appear after clicking channel tile.", success: false };
+    return;
   }
 
-  // Get the play button coordinates for clicking.
-  const playTarget = await evaluateWithAbort(page, (selector: string): ClickTarget | null => {
-
-    const button = document.querySelector(selector);
-
-    if(!button) {
-
-      return null;
-    }
-
-    (button as HTMLElement).scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
-
-    const rect = button.getBoundingClientRect();
-
-    if((rect.width > 0) && (rect.height > 0)) {
-
-      return { x: rect.x + (rect.width / 2), y: rect.y + (rect.height / 2) };
-    }
-
-    return null;
-  }, [playButtonSelector]);
-
-  if(!playTarget) {
-
-    return { reason: "Play button found but has no dimensions.", success: false };
-  }
-
-  // Click the play button to start live playback.
-  await scrollAndClick(page, playTarget);
-
-  return { success: true };
+  LOG.warn("Channel \"%s\" not found in %s guide. Create a user-defined channel with one of the names below as the Channel Selector and %s as the URL. " +
+    "Available channels (%s): %s.", channelName, providerName, guideUrl, countLabel, filteredChannels.join(", "));
 }
-
-/*
- * MAIN ENTRY POINT
- *
- * The selectChannel() function is the public API for channel selection. It delegates to the appropriate strategy based on the profile configuration.
- */
 
 /**
  * Selects a channel from a multi-channel player UI using the strategy specified in the profile. This is the main entry point for channel selection, called by
  * tuneToChannel() after page navigation.
  *
  * The function handles:
- * - Polling for channel slug image readiness before strategy dispatch
+ * - Polling for channel element readiness before strategy dispatch (when profile.channelSelection.matchSelector is set)
  * - Strategy dispatch based on profile.channelSelection.strategy
  * - No-op for single-channel sites (strategy "none" or no channelSelector)
  * - Logging of selection attempts and results
@@ -354,63 +253,70 @@ async function tileClickStrategy(page: Page, channelSlug: string): Promise<Chann
  */
 export async function selectChannel(page: Page, profile: ResolvedSiteProfile): Promise<ChannelSelectorResult> {
 
-  const { channelSelection, channelSelector } = profile;
+  const { channelSelection } = profile;
 
   // No channel selection needed if strategy is "none" or no channelSelector is specified.
-  if((channelSelection.strategy === "none") || !channelSelector) {
+  if((channelSelection.strategy === "none") || !isChannelSelectionProfile(profile)) {
 
     return { success: true };
   }
 
-  // Poll for the channel slug image to appear in the DOM. This replaces a fixed delay with an early-exit poll — if the guide renders quickly, we proceed
-  // immediately instead of waiting the full configured duration. The configured delay serves as the timeout ceiling.
-  try {
+  const entry = strategies[channelSelection.strategy];
 
-    await page.waitForFunction(
-      (slug: string): boolean => {
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+  if(!entry) {
 
-        return Array.from(document.querySelectorAll("img")).some((img) => img.src && img.src.includes(slug));
-      },
-      { timeout: CONFIG.playback.channelSelectorDelay },
-      channelSelector
-    );
-  } catch {
+    LOG.warn("Unknown channel selection strategy: %s.", channelSelection.strategy);
 
-    // Timeout — the image hasn't appeared yet. Proceed anyway and let the strategy evaluate and report not-found naturally.
+    return { reason: "Unknown channel selection strategy.", success: false };
   }
 
-  // Dispatch to the appropriate strategy.
-  let result: ChannelSelectorResult;
+  // Poll for the channel element to appear and become visible. Only run when matchSelector is explicitly configured — the default fallback in
+  // resolveMatchSelector() is for strategy-internal use, and guide-based strategies that don't set matchSelector skip this wait entirely. For <img> elements, we
+  // also verify load completion (img.complete + naturalWidth) to prevent race conditions where the element exists with the correct src but hasn't finished
+  // rendering, which can cause layout instability and click failures.
+  if(channelSelection.matchSelector) {
 
-  switch(channelSelection.strategy) {
+    const selector = resolveMatchSelector(profile);
 
-    case "thumbnailRow": {
+    try {
 
-      result = await thumbnailRowStrategy(page, channelSelector);
+      await page.waitForFunction(
+        (sel: string): boolean => {
 
-      break;
-    }
+          const el = document.querySelector(sel);
 
-    case "tileClick": {
+          if(!el) {
 
-      result = await tileClickStrategy(page, channelSelector);
+            return false;
+          }
 
-      break;
-    }
+          const rect = el.getBoundingClientRect();
 
-    default: {
+          if(!((rect.width > 0) && (rect.height > 0))) {
 
-      // Unknown strategy - this shouldn't happen if profiles are validated, but handle gracefully.
-      LOG.warn("Unknown channel selection strategy: %s.", channelSelection.strategy);
+            return false;
+          }
 
-      return { reason: "Unknown channel selection strategy.", success: false };
+          // For <img> elements, also verify the image has fully loaded.
+          if(el instanceof HTMLImageElement) {
+
+            return el.complete && (el.naturalWidth > 0);
+          }
+
+          return true;
+        },
+        { timeout: CONFIG.playback.channelSelectorDelay },
+        selector
+      );
+    } catch {
+
+      // Timeout — the element hasn't appeared or loaded yet. Proceed anyway and let the strategy evaluate and report not-found naturally.
     }
   }
 
-  if(!result.success) {
-
-    LOG.warn("Failed to select %s from channel guide: %s", channelSelector, result.reason ?? "Unknown reason.");
-  }
+  // Dispatch to the appropriate strategy via the registry.
+  const result = await entry.execute(page, profile);
 
   return result;
 }

@@ -5,15 +5,12 @@
 import type { Frame, Page } from "puppeteer-core";
 import { getStreamId } from "./streamContext.js";
 
-/*
- * EVALUATE WITH ABORT AND TIMEOUT
+/* This module provides a wrapper around Puppeteer's page.evaluate() and frame.evaluate() that adds two critical safety mechanisms:
  *
- * This module provides a wrapper around Puppeteer's page.evaluate() and frame.evaluate() that adds two critical safety mechanisms:
- *
- * 1. ABORT SIGNAL: When a stream is terminated, its AbortController is triggered, immediately rejecting all pending evaluate calls for that stream. This prevents zombie
+ * 1. Abort signal: When a stream is terminated, its AbortController is triggered, immediately rejecting all pending evaluate calls for that stream. This prevents zombie
  *    CDP calls from hanging for 180 seconds (Puppeteer's default protocolTimeout) when the browser becomes unresponsive.
  *
- * 2. TIMEOUT: A configurable timeout (default 15 seconds) provides a safety net for evaluate calls that hang. This catches cases where the browser is unresponsive but
+ * 2. Timeout: A configurable timeout (default 15 seconds) provides a safety net for evaluate calls that hang. This catches cases where the browser is unresponsive but
  *    the stream hasn't been explicitly terminated yet.
  *
  * The wrapper automatically retrieves the abort signal from the stream registry using the stream context from AsyncLocalStorage. If no stream context is available
@@ -135,7 +132,7 @@ export async function evaluateWithAbort<T, Args extends unknown[]>(
 
   // Attach a no-op catch to suppress unhandled rejection warnings. When we abort or timeout, the underlying CDP call is still pending and will eventually resolve or
   // reject. Without this, we'd get unhandled rejection warnings when the CDP call completes after we've moved on.
-  evaluatePromise.catch(() => {});
+  evaluatePromise.catch(() => { /* Suppress unhandled rejection from pending CDP calls after abort/timeout. */ });
 
   // Create the timeout promise.
   const timeoutPromise = new Promise<never>((_, reject) => {

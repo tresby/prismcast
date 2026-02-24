@@ -15,10 +15,7 @@ import { spawn } from "node:child_process";
 // The ffmpeg-for-homebridge package has incorrect type definitions (declares named export but JS uses default export). Cast to the correct type.
 const ffmpegPath = ffmpegForHomebridge as unknown as string | undefined;
 
-/*
- * FFMPEG TRANSCODING
- *
- * When using WebM capture mode, Chrome's MediaRecorder outputs WebM container with H264 video and Opus audio. For HLS compatibility, we need fMP4 container with
+/* When using WebM capture mode, Chrome's MediaRecorder outputs WebM container with H264 video and Opus audio. For HLS compatibility, we need fMP4 container with
  * H264 video and AAC audio. FFmpeg handles this conversion:
  *
  * - Video: Passed through unchanged (copy codec) - no quality loss, minimal CPU
@@ -29,10 +26,7 @@ const ffmpegPath = ffmpegForHomebridge as unknown as string | undefined;
  * segmenter.
  */
 
-/*
- * FFMPEG PATH RESOLUTION
- *
- * FFmpeg can be located in several places depending on how it was installed. We check in order of preference:
+/* FFmpeg can be located in several places depending on how it was installed. We check in order of preference:
  * 1. Channels DVR bundled FFmpeg:
  *    - macOS: ~/Library/Application Support/ChannelsDVR/latest/ffmpeg
  *    - Windows: C:\ProgramData\channelsdvr\latest\ffmpeg.exe
@@ -179,6 +173,7 @@ export interface FFmpegProcess {
  *
  * FFmpeg arguments:
  * - `-hide_banner -loglevel warning`: Reduce noise, only show warnings/errors
+ * - `-probesize 16384`: Limit input probing to 16KB (Chrome's WebM header fits well under this) to minimize startup delay
  * - `-i pipe:0`: Read input from stdin
  * - `-c:v copy`: Copy video stream without re-encoding (H264 passthrough)
  * - `-c:a aac -b:a <bitrate>`: Transcode audio to AAC at specified bitrate
@@ -204,6 +199,7 @@ export function spawnFFmpeg(audioBitrate: number, onError: (error: Error) => voi
   const ffmpegArgs = [
     "-hide_banner",
     "-loglevel", "warning",
+    "-probesize", "16384",
     "-i", "pipe:0",
     "-c:v", "copy",
     "-c:a", aacEncoder,
@@ -252,7 +248,7 @@ export function spawnFFmpeg(audioBitrate: number, onError: (error: Error) => voi
 
     if(message.length > 0) {
 
-      LOG.debug("%sFFmpeg: %s", logPrefix, message);
+      LOG.debug("streaming:ffmpeg", "%sFFmpeg: %s", logPrefix, message);
     }
   });
 
@@ -308,8 +304,8 @@ export function spawnFFmpeg(audioBitrate: number, onError: (error: Error) => voi
 
     kill,
     process: ffmpeg,
-    stdin: ffmpeg.stdin as Writable,
-    stdout: ffmpeg.stdout as Readable
+    stdin: ffmpeg.stdin,
+    stdout: ffmpeg.stdout
   };
 }
 
@@ -319,9 +315,16 @@ export function spawnFFmpeg(audioBitrate: number, onError: (error: Error) => voi
  *
  * FFmpeg arguments:
  * - `-hide_banner -loglevel warning`: Reduce noise, only show warnings/errors
+ * - `-probesize 16384`: Limit input probing to 16KB (fMP4 init segment is ~1.3KB) to minimize startup delay
  * - `-f mp4 -i pipe:0`: Read fragmented MP4 from stdin
  * - `-c copy`: Copy both video and audio codecs without transcoding
  * - `-f mpegts`: Output MPEG-TS container format
+ * - `-mpegts_pmt_start_pid 0x0020`: Use ATSC-conventional PMT PID range instead of FFmpeg's default (0x1000). Minimum allowed value is 0x0020 (32).
+ * - `-mpegts_start_pid 0x0031`: Use ATSC-conventional elementary stream PIDs instead of FFmpeg's defaults (0x100+)
+ * - `-mpegts_service_type digital_tv`: Label the service as digital TV in the PMT service descriptor
+ * - `-pat_period 0.1`: Repeat PAT/PMT tables every 100ms, matching ATSC broadcast frequency
+ * - `-pcr_period 40`: Insert PCR timestamps every 40ms, matching ATSC broadcast convention
+ * - `-flush_packets 1`: Flush output immediately after each packet to minimize latency
  * - `pipe:1`: Write output to stdout
  * @param onError - Callback invoked when FFmpeg exits unexpectedly or encounters an error.
  * @param streamId - Optional stream identifier for logging.
@@ -331,13 +334,24 @@ export function spawnMpegTsRemuxer(onError: (error: Error) => void, streamId?: s
 
   const ffmpegBin = cachedFFmpegPath ?? "ffmpeg";
 
+  // MPEG-TS muxer flags are tuned to produce output resembling a real HDHomeRun CONNECT DUO (HDTC-2US) ATSC transport stream. Plex's transcoder may make
+  // assumptions about stream structure based on the reported device model (PID assignments, PAT/PMT frequency). Using ATSC-conventional values avoids "Invalid
+  // argument" failures when Plex tries to transcode the live session for remote clients. These are pure container metadata changes — the actual A/V data is
+  // untouched by -c copy.
   const ffmpegArgs = [
     "-hide_banner",
     "-loglevel", "warning",
+    "-probesize", "16384",
     "-f", "mp4",
     "-i", "pipe:0",
     "-c", "copy",
     "-f", "mpegts",
+    "-mpegts_pmt_start_pid", "0x0020",
+    "-mpegts_start_pid", "0x0031",
+    "-mpegts_service_type", "digital_tv",
+    "-pat_period", "0.1",
+    "-pcr_period", "40",
+    "-flush_packets", "1",
     "pipe:1"
   ];
 
@@ -369,7 +383,7 @@ export function spawnMpegTsRemuxer(onError: (error: Error) => void, streamId?: s
 
     if(message.length > 0) {
 
-      LOG.debug("%sMPEG-TS remuxer: %s", logPrefix, message);
+      LOG.debug("streaming:ffmpeg", "%sMPEG-TS remuxer: %s", logPrefix, message);
     }
   });
 
@@ -421,8 +435,8 @@ export function spawnMpegTsRemuxer(onError: (error: Error) => void, streamId?: s
 
     kill,
     process: ffmpeg,
-    stdin: ffmpeg.stdin as Writable,
-    stdout: ffmpeg.stdout as Readable
+    stdin: ffmpeg.stdin,
+    stdout: ffmpeg.stdout
   };
 }
 

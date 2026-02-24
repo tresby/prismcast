@@ -6,6 +6,8 @@ import { DEFAULTS, loadUserConfig } from "../config/userConfig.js";
 import { SERVICE_NAME, getPlatform, getServiceFilePath } from "../utils/platform.js";
 import { collectServiceEnvironment, getServiceGenerator } from "./generators.js";
 import type { Nullable } from "../types/index.js";
+import { getDataDir } from "../config/paths.js";
+import path from "node:path";
 
 // Types.
 
@@ -16,18 +18,15 @@ interface StreamsResponse {
 
   count: number;
   limit: number;
-  streams: Array<{
+  streams: {
     channel: Nullable<string>;
     duration: number;
     id: number;
     url: string;
-  }>;
+  }[];
 }
 
-/*
- * SERVICE COMMAND HANDLERS
- *
- * These handlers implement the `prismcast service` subcommands for installing, uninstalling, and checking the status of PrismCast as a system service. Each handler
+/* These handlers implement the `prismcast service` subcommands for installing, uninstalling, and checking the status of PrismCast as a system service. Each handler
  * prints its output directly to the console and exits with an appropriate status code.
  */
 
@@ -60,7 +59,7 @@ function formatDuration(seconds: number): string {
 
   if(seconds < 60) {
 
-    return seconds + "s";
+    return String(seconds) + "s";
   }
 
   if(seconds < 3600) {
@@ -68,13 +67,13 @@ function formatDuration(seconds: number): string {
     const minutes = Math.floor(seconds / 60);
     const secs = seconds % 60;
 
-    return secs > 0 ? minutes + "m " + secs + "s" : minutes + "m";
+    return secs > 0 ? String(minutes) + "m " + String(secs) + "s" : String(minutes) + "m";
   }
 
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
 
-  return minutes > 0 ? hours + "h " + minutes + "m" : hours + "h";
+  return minutes > 0 ? String(hours) + "h " + String(minutes) + "m" : String(hours) + "h";
 }
 
 /**
@@ -87,9 +86,9 @@ async function fetchActiveStreams(port: number): Promise<Nullable<StreamsRespons
   try {
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 3000);
+    const timeoutId = setTimeout(() => { controller.abort(); }, 3000);
 
-    const response = await fetch("http://127.0.0.1:" + port + "/streams", { signal: controller.signal });
+    const response = await fetch("http://127.0.0.1:" + String(port) + "/streams", { signal: controller.signal });
 
     clearTimeout(timeoutId);
 
@@ -135,7 +134,7 @@ export function printServiceUsage(): void {
   print("  --force             Force reinstall even if already installed");
   print("");
   print("The service runs as the current user and starts automatically at login.");
-  print("Configuration is read from ~/.prismcast/config.json.");
+  print("Configuration is read from " + path.join(getDataDir(), "config.json") + ".");
 }
 
 /**
@@ -203,8 +202,8 @@ export async function handleInstall(force: boolean): Promise<number> {
       print("The service is now running and will start automatically at login.");
       print("");
       print("Useful commands:");
-      print("  View logs:        tail -f ~/.prismcast/prismcast.log");
-      print("  View service log: tail -f ~/.prismcast/service-stdout.log");
+      print("  View logs:        tail -f " + path.join(getDataDir(), "prismcast.log"));
+      print("  View service log: tail -f " + path.join(getDataDir(), "service-stdout.log"));
       print("  Stop service:     prismcast service stop");
       print("  Start service:    prismcast service start");
       print("  Status:           prismcast service status");
@@ -217,7 +216,7 @@ export async function handleInstall(force: boolean): Promise<number> {
       print("The service is now running and will start automatically at login.");
       print("");
       print("Useful commands:");
-      print("  View logs:     tail -f ~/.prismcast/prismcast.log");
+      print("  View logs:     tail -f " + path.join(getDataDir(), "prismcast.log"));
       print("  View journal:  journalctl --user -u prismcast -f");
       print("  Stop service:  prismcast service stop");
       print("  Start service: prismcast service start");
@@ -231,7 +230,7 @@ export async function handleInstall(force: boolean): Promise<number> {
       print("The service is now running and will start automatically at login.");
       print("");
       print("Useful commands:");
-      print("  View logs:     type %USERPROFILE%\\.prismcast\\prismcast.log");
+      print("  View logs:     type " + path.join(getDataDir(), "prismcast.log"));
       print("  Stop service:  prismcast service stop");
       print("  Start service: prismcast service start");
       print("  Status:        prismcast service status");
@@ -287,8 +286,8 @@ export async function handleUninstall(): Promise<number> {
 
   print("Service uninstalled successfully.");
   print("");
-  print("Note: Configuration and data files in ~/.prismcast/ have been preserved.");
-  print("To remove all data, delete the ~/.prismcast directory manually.");
+  print("Note: Configuration and data files in " + getDataDir() + " have been preserved.");
+  print("To remove all data, delete the " + getDataDir() + " directory manually.");
 
   return 0;
 }
@@ -468,10 +467,10 @@ export async function handleStatus(): Promise<number> {
       print("Active streams:  (server not responding)");
     } else if(streamsData.count === 0) {
 
-      print("Active streams:  0/" + streamsData.limit);
+      print("Active streams:  0/" + String(streamsData.limit));
     } else {
 
-      print("Active streams:  " + streamsData.count + "/" + streamsData.limit);
+      print("Active streams:  " + String(streamsData.count) + "/" + String(streamsData.limit));
 
       for(const stream of streamsData.streams) {
 
@@ -485,7 +484,7 @@ export async function handleStatus(): Promise<number> {
             name = new URL(stream.url).hostname.replace(/^www\./, "");
           } catch {
 
-            name = "Stream " + stream.id;
+            name = "Stream " + String(stream.id);
           }
         }
 

@@ -4,24 +4,24 @@
  */
 import type { Channel, Nullable, ResolvedSiteProfile, UrlValidation } from "../types/index.js";
 import type { Frame, Page } from "puppeteer-core";
-import { LOG, delay, formatError, registerAbortController, retryOperation, runWithStreamContext, spawnFFmpeg } from "../utils/index.js";
+import { LOG, delay, extractDomain, formatError, registerAbortController, retryOperation, runWithStreamContext, spawnFFmpeg, startTimer } from "../utils/index.js";
 import type { MonitorStreamInfo, RecoveryMetrics, TabReplacementResult } from "./monitor.js";
-import { closeBrowser, getCurrentBrowser, getStream, minimizeBrowserWindow, registerManagedPage, unregisterManagedPage } from "../browser/index.js";
+import { getCurrentBrowser, getStream, minimizeBrowserWindow, registerManagedPage, unregisterManagedPage } from "../browser/index.js";
 import { getNextStreamId, getStreamCount } from "./registry.js";
 import { getProfileForChannel, getProfileForUrl, getProfiles, resolveProfile } from "../config/profiles.js";
+import { initializePlayback, navigateToPage } from "../browser/video.js";
+import { invalidateDirectUrl, resolveDirectUrl } from "../browser/channelSelection.js";
 import { CONFIG } from "../config/index.js";
 import type { FFmpegProcess } from "../utils/index.js";
 import type { Readable } from "node:stream";
 import { getEffectiveViewport } from "../config/presets.js";
+import { getProviderDisplayName } from "../config/providers.js";
+import { isChannelSelectionProfile } from "../types/index.js";
 import { monitorPlaybackHealth } from "./monitor.js";
 import { pipeline } from "node:stream/promises";
 import { resizeAndMinimizeWindow } from "../browser/cdp.js";
-import { tuneToChannel } from "../browser/video.js";
 
-/*
- * STREAM SETUP
- *
- * This module contains the common stream setup logic for HLS streaming. The core logic is split into two functions:
+/* This module contains the common stream setup logic for HLS streaming. The core logic is split into two functions:
  *
  * 1. createPageWithCapture(): Creates a browser page, starts media capture, navigates to the URL, and sets up video playback. This is the reusable core that both
  *    initial stream setup and tab replacement recovery use.
@@ -57,10 +57,9 @@ const WEBM_FFMPEG_MIME_TYPE = "video/webm;codecs=h264,opus";
 // concurrently with other captures without issue.
 let captureQueue: Promise<void> = Promise.resolve();
 
-// Stale capture recovery. Chrome's tabCapture can retain stale state after a crash, causing "Cannot capture a tab with an active stream" errors on fresh launches.
-// When detected, we restart Chrome entirely to clear the state. Limited to 3 attempts per server lifetime to prevent infinite loops.
-const MAX_STALE_CAPTURE_RECOVERY_ATTEMPTS = 3;
-let staleCaptureRecoveryAttempts = 0;
+// Maximum number of times createPageWithCapture() will retry when it detects that the page was closed while waiting in the capture queue (e.g., due to a browser
+// crash). An explicit guard prevents unbounded recursion.
+const MAX_PAGE_CLOSED_RETRIES = 3;
 
 // Types.
 
@@ -73,7 +72,7 @@ export type TabReplacementHandlerFactory = (
   streamId: string,
   profile: ResolvedSiteProfile,
   metadataComment: string | undefined
-) => () => Promise<TabReplacementResult | null>;
+) => () => Promise<Nullable<TabReplacementResult>>;
 
 /**
  * Options for setting up a stream.
@@ -89,6 +88,12 @@ export interface StreamSetupOptions {
   // Channel selector for multi-channel sites. Only used for ad-hoc streams (no channel definition). For predefined channels, the selector comes from
   // channel.channelSelector via getProfileForChannel.
   channelSelector?: string;
+
+  // Click selector for play button overlays. Only used for ad-hoc streams. For predefined channels, the selector comes from the profile definition.
+  clickSelector?: string;
+
+  // Whether to click an element to start playback. Only used for ad-hoc streams. For predefined channels, this comes from the profile definition.
+  clickToPlay?: boolean;
 
   // Whether to treat this as a static page without video.
   noVideo?: boolean;
@@ -115,6 +120,9 @@ export interface StreamSetupResult {
   // The channel display name if streaming a named channel.
   channelName: Nullable<string>;
 
+  // Whether this tune used a cached direct URL, skipping guide navigation.
+  directTune: boolean;
+
   // Cleanup function to release all resources. Safe to call multiple times.
   cleanup: () => Promise<void>;
 
@@ -132,6 +140,9 @@ export interface StreamSetupResult {
 
   // The name of the resolved profile (e.g., "keyboardDynamic", "fullscreenApi", "default").
   profileName: string;
+
+  // Friendly provider display name derived from the URL domain via DOMAIN_CONFIG (e.g., "Hulu" for hulu.com). Used for SSE status display.
+  providerName: string;
 
   // The raw capture stream from puppeteer-stream. Must be destroyed before closing the page.
   rawCaptureStream: Readable;
@@ -186,6 +197,10 @@ export interface CreatePageWithCaptureOptions {
 
   // The URL to navigate to and capture.
   url: string;
+
+  // Internal retry counter for page-closed-during-queue recovery. Callers should not set this — it is incremented automatically when createPageWithCapture()
+  // retries after detecting a dead page from a browser crash that occurred while waiting in the capture queue.
+  _pageClosedRetries?: number;
 }
 
 /**
@@ -198,6 +213,9 @@ export interface CreatePageWithCaptureResult {
 
   // The video context (page or frame containing the video element).
   context: Frame | Page;
+
+  // Whether this tune used a cached direct URL, skipping guide navigation.
+  directTune: boolean;
 
   // The FFmpeg process if using WebM+FFmpeg mode, null otherwise.
   ffmpegProcess: Nullable<FFmpegProcess>;
@@ -232,22 +250,6 @@ function generateRequestId(): string {
 }
 
 /**
- * Extracts the domain from a URL, removing the www. prefix for cleaner display. Returns undefined if the URL cannot be parsed.
- * @param url - The URL to extract the domain from.
- * @returns The domain without www. prefix, or undefined if parsing fails.
- */
-function extractDomain(url: string): string | undefined {
-
-  try {
-
-    return new URL(url).hostname.replace(/^www\./, "");
-  } catch {
-
-    return undefined;
-  }
-}
-
-/**
  * Generates a concise stream identifier for logging purposes. The identifier combines the channel name or hostname with a unique request ID, making it easy to
  * trace related log messages. We prefer the channel name when available because it's more meaningful than a hostname.
  * @param channelName - The channel name if streaming a named channel.
@@ -264,20 +266,10 @@ export function generateStreamId(channelName: string | undefined, url: string | 
     return [ channelName, "-", requestId ].join("");
   }
 
-  // For direct URL requests, extract the hostname for the prefix.
+  // For direct URL requests, use the concise domain as the prefix.
   if(url) {
 
-    const domain = extractDomain(url);
-
-    if(domain) {
-
-      return [ domain, "-", requestId ].join("");
-    }
-
-    // If URL parsing fails, use a truncated version of the URL. This handles malformed URLs gracefully.
-    const truncated = url.length > 20 ? [ url.substring(0, 20), "..." ].join("") : url;
-
-    return [ truncated, "-", requestId ].join("");
+    return [ extractDomain(url), "-", requestId ].join("");
   }
 
   // Fallback when neither channel name nor URL is available. This shouldn't happen in normal operation but provides a valid ID for edge cases.
@@ -336,7 +328,7 @@ export function validateStreamUrl(url: string | undefined): UrlValidation {
  * - Creating a new browser page with CSP bypass
  * - Initializing media capture (native fMP4 or WebM+FFmpeg)
  * - Navigating to the URL with retry
- * - Setting up video playback via tuneToChannel()
+ * - Setting up video playback via navigateToPage() + initializePlayback()
  *
  * The caller is responsible for:
  * - Creating the segmenter and piping captureStream to it
@@ -350,6 +342,7 @@ export function validateStreamUrl(url: string | undefined): UrlValidation {
  */
 export async function createPageWithCapture(options: CreatePageWithCaptureOptions): Promise<CreatePageWithCaptureResult> {
 
+  const captureElapsed = startTimer();
   const { comment, onFFmpegError, profile, streamId, url } = options;
 
   // Create browser page.
@@ -370,6 +363,20 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
   let rawCaptureStream: Nullable<Readable> = null;
   let ffmpegProcess: Nullable<FFmpegProcess> = null;
 
+  // Capture queue release function, hoisted here so both the try and catch blocks can access it. Initialized in the try block when the queue entry is created.
+  // The once-guard prevents double-releasing from multiple code paths (success handler, catch block, timeout).
+  let captureQueueReleased = false;
+  let releaseCaptureQueue: () => void = () => { /* No-op until queue entry assigns the real release function. */ };
+
+  const releaseCaptureOnce = (): void => {
+
+    if(!captureQueueReleased) {
+
+      captureQueueReleased = true;
+      releaseCaptureQueue();
+    }
+  };
+
   // Initialize media stream capture.
   try {
 
@@ -387,7 +394,7 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
           maxFrameRate: 60,
           maxHeight: getEffectiveViewport(CONFIG).height,
           maxWidth: getEffectiveViewport(CONFIG).width,
-          minFrameRate: CONFIG.streaming.frameRate,
+          minFrameRate: Math.max(30, Math.min(60, CONFIG.streaming.frameRate)),
           minHeight: getEffectiveViewport(CONFIG).height,
           minWidth: getEffectiveViewport(CONFIG).width
         }
@@ -395,10 +402,8 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
     } as unknown as Parameters<typeof getStream>[1];
 
     // Serialize capture initialization. Wait for any previous capture to finish before calling getStream(), because Chrome's tabCapture extension rejects
-    // concurrent initialization attempts. The lock is released when getStream() resolves or rejects (not when our timeout fires), because Chrome's extension state
-    // is what matters. If our timeout fires while getStream() is still in-flight, the catch block closes the page, which causes the pending getStream() to reject,
-    // which releases the lock and allows the next queued capture to proceed.
-    let releaseCaptureQueue: () => void = () => {};
+    // concurrent initialization attempts. On success, the lock is released immediately so the next caller can proceed. On failure, the lock is held until the
+    // catch block decides what to do — the catch block releases the lock after handling the error.
     const previousCapture = captureQueue;
 
     captureQueue = new Promise<void>((resolve) => {
@@ -423,15 +428,33 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
     } catch(error) {
 
       // Release our queue position so subsequent captures aren't blocked by our failure.
-      releaseCaptureQueue();
+      releaseCaptureOnce();
 
       throw error;
     }
 
+    // After the queue wait, verify our page is still connected. If Chrome crashed while we were waiting, our page is dead and we need to start over with a
+    // fresh page on the new browser. Release our queue position first so subsequent callers aren't blocked.
+    if(page.isClosed()) {
+
+      releaseCaptureOnce();
+      unregisterManagedPage(page);
+
+      const retryCount = options._pageClosedRetries ?? 0;
+
+      if(retryCount >= MAX_PAGE_CLOSED_RETRIES) {
+
+        throw new Error("Browser crashed too many times during capture initialization.");
+      }
+
+      return await createPageWithCapture({ ...options, _pageClosedRetries: retryCount + 1 });
+    }
+
     const streamPromise = getStream(page, streamOptions);
 
-    // Release the queue when getStream() completes, regardless of success or failure. This is independent of our application timeout below.
-    void streamPromise.then(() => releaseCaptureQueue(), () => releaseCaptureQueue());
+    // Release the queue on success only. On failure, the catch block handles the release. The rejection handler is a no-op to suppress unhandled rejection
+    // warnings; the actual error handling happens in the catch block below.
+    void streamPromise.then(() => { releaseCaptureOnce(); }, () => { /* Suppress unhandled rejection; actual error handling is in the catch block below. */ });
 
     const timeoutPromise = new Promise<never>((_, reject) => {
 
@@ -468,7 +491,7 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
 
         if(errorMessage.includes("EPIPE")) {
 
-          LOG.debug("FFmpeg stdout pipe closed: %s.", errorMessage);
+          LOG.debug("streaming:ffmpeg", "FFmpeg stdout pipe closed: %s.", errorMessage);
         } else {
 
           LOG.error("FFmpeg stdout pipe error: %s.", errorMessage);
@@ -483,7 +506,7 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
 
       // Pipe the WebM capture stream to FFmpeg's stdin using pipeline() for proper cleanup. When FFmpeg is killed during tab replacement, pipeline() automatically
       // destroys the source stream, preventing "write after end" errors that would occur with .pipe().
-      pipeline(stream as unknown as Readable, ffmpeg.stdin).catch((error) => {
+      pipeline(stream as unknown as Readable, ffmpeg.stdin).catch((error: unknown) => {
 
         const errorMessage = formatError(error);
 
@@ -499,7 +522,7 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
 
         if(onFFmpegError) {
 
-          onFFmpegError(error);
+          onFFmpegError(error instanceof Error ? error : new Error(String(error)));
         }
       });
 
@@ -522,55 +545,80 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
 
     if(!page.isClosed()) {
 
-      page.close().catch(() => {});
+      page.close().catch(() => { /* Fire-and-forget during error cleanup. */ });
     }
 
-    // Check for stale capture state error. This occurs after a crash when Chrome's tabCapture retains state from the previous process. Restarting Chrome clears
-    // the stale state. We limit recovery attempts to prevent infinite loops if the issue persists.
     const errorMessage = formatError(error);
 
-    if(errorMessage.includes("Cannot capture a tab with an active stream") && (staleCaptureRecoveryAttempts < MAX_STALE_CAPTURE_RECOVERY_ATTEMPTS)) {
+    // Stale capture state is unrecoverable. The "Cannot capture a tab with an active stream" error occurs inside puppeteer-stream's second lock section, which
+    // has no try/finally. The internal mutex is permanently leaked — all subsequent getStream() calls will hang on it. Chrome restart cannot fix module-level
+    // state, so the only recourse is a full process restart. Release the capture queue so other callers aren't left hanging, then exit.
+    if(errorMessage.includes("Cannot capture a tab with an active stream")) {
 
-      staleCaptureRecoveryAttempts++;
+      LOG.error("Stale capture state detected. puppeteer-stream's internal capture mutex is now permanently locked. The capture system is unrecoverable. " +
+        "Exiting so the service manager can restart with a clean module state.");
 
-      LOG.warn("Stale capture state detected (attempt %d/%d). Restarting Chrome to clear state.",
-        staleCaptureRecoveryAttempts, MAX_STALE_CAPTURE_RECOVERY_ATTEMPTS);
+      releaseCaptureOnce();
 
-      // Kill Chrome entirely to clear all tabCapture state.
-      await closeBrowser();
+      setTimeout(() => process.exit(1), 100);
 
-      // Wait for Chrome to fully exit before relaunching.
-      await delay(1500);
-
-      // Relaunch Chrome. getCurrentBrowser() creates a fresh instance since closeBrowser() cleared the reference.
-      await getCurrentBrowser();
-
-      // Retry the capture with a fresh browser.
-      return createPageWithCapture(options);
+      throw error;
     }
+
+    // For non-stale errors, release the capture queue so subsequent callers can proceed.
+    releaseCaptureOnce();
 
     throw error;
   }
 
   // Navigate and set up playback. For noVideo profiles, just navigate without video setup.
   let context: Frame | Page;
+  let usedDirectUrl = false;
 
   try {
 
-    if(profile.noVideo === false) {
+    if(!profile.noVideo) {
 
-      // Since we don't pass an earlySuccessCheck, retryOperation will always return the value (not void). The type assertion is safe.
-      const tuneResult = await retryOperation(
-        async (): Promise<{ context: Frame | Page }> => {
+      // Check for a direct watch URL. If available, navigate directly to it and skip channel selection, avoiding guide page navigation entirely. On failure,
+      // the cache entry is invalidated in the catch block so the outer retry loop (in streaming/hls.ts) re-invokes with the guide URL.
+      const directUrl = await resolveDirectUrl(profile, page);
 
-          return tuneToChannel(page, url, profile);
+      usedDirectUrl = !!directUrl;
+
+      const navigationUrl = directUrl ?? url;
+
+      // Phase 1: Navigate to the page with retry. The 10-second navigationTimeout is appropriate for page loads, and retryOperation correctly reloads the page on
+      // genuine navigation failures. Navigation is wrapped in retryOperation separately from channel selection so the timeout does not race with the internal click
+      // retry loops in channel selection strategies (guideGrid can take 15-20 seconds for binary search + click retries).
+      await retryOperation(
+        async (): Promise<void> => {
+
+          await navigateToPage(page, navigationUrl, profile);
         },
         CONFIG.streaming.maxNavigationRetries,
         CONFIG.streaming.navigationTimeout,
-        "page navigation for " + url,
+        "page navigation for " + navigationUrl,
         undefined,
         () => page.isClosed()
-      ) as { context: Frame | Page };
+      );
+
+      // Phase 2: Channel selection + video setup. When navigating to a cached direct URL, skip channel selection since the URL already targets the correct
+      // channel. Runs after navigation succeeds with no outer timeout racing against internal click retries. Each sub-step (selectChannel, waitForVideoReady,
+      // etc.) has its own internal timeout via videoTimeout and click retry constants. For guideGrid strategies, a channel selection failure triggers an overlay
+      // dismiss and retry, which doubles the channel selection time budget. The 45-second safety-net timeout accommodates this retry while still preventing
+      // pathological hangs if multiple internal timeouts chain sequentially.
+      const PLAYBACK_INIT_TIMEOUT = 45000;
+
+      const tuneResult = await Promise.race([
+        initializePlayback(page, profile, usedDirectUrl),
+        new Promise<never>((_, reject) => {
+
+          setTimeout(() => {
+
+            reject(new Error("Playback initialization timed out after " + String(PLAYBACK_INIT_TIMEOUT) + "ms."));
+          }, PLAYBACK_INIT_TIMEOUT);
+        })
+      ]);
 
       context = tuneResult.context;
     } else {
@@ -580,7 +628,13 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
     }
   } catch(error) {
 
-    // Clean up on navigation failure. Destroy the raw capture stream first to ensure chrome.tabCapture releases the capture.
+    // If a cached direct URL was used, invalidate it so the next attempt falls through to guide navigation.
+    if(usedDirectUrl) {
+
+      invalidateDirectUrl(profile);
+    }
+
+    // Clean up on navigation or playback initialization failure. Destroy the raw capture stream first to ensure chrome.tabCapture releases the capture.
     if(!rawCaptureStream.destroyed) {
 
       rawCaptureStream.destroy();
@@ -595,8 +649,12 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
 
     if(!page.isClosed()) {
 
-      page.close().catch(() => {});
+      page.close().catch(() => { /* Fire-and-forget during error cleanup. */ });
     }
+
+    // Re-minimize the browser window. Navigation may have un-minimized it (new tab activation on macOS), and without this the window stays visible after the
+    // failed attempt. Fire-and-forget since we're about to throw.
+    minimizeBrowserWindow().catch(() => { /* Fire-and-forget; we're about to throw. */ });
 
     throw error;
   }
@@ -604,10 +662,13 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
   // Resize and minimize window.
   await resizeAndMinimizeWindow(page, !profile.noVideo);
 
+  LOG.debug("timing:startup", "Page with capture ready. Total: %sms.", captureElapsed());
+
   return {
 
     captureStream: outputStream,
     context,
+    directTune: usedDirectUrl || !isChannelSelectionProfile(profile),
     ffmpegProcess,
     page,
     rawCaptureStream
@@ -625,7 +686,7 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
  * @param url - The URL to resolve.
  * @returns The final URL after following all redirects, or null on any error.
  */
-async function resolveRedirectUrl(url: string): Promise<string | null> {
+async function resolveRedirectUrl(url: string): Promise<Nullable<string>> {
 
   try {
 
@@ -655,7 +716,7 @@ async function resolveRedirectUrl(url: string): Promise<string | null> {
  */
 export async function setupStream(options: StreamSetupOptions, onCircuitBreak: () => void): Promise<StreamSetupResult> {
 
-  const { channel, channelName, channelSelector, noVideo, onTabReplacementFactory, profileOverride, url } = options;
+  const { channel, channelName, channelSelector, clickSelector, clickToPlay, noVideo, onTabReplacementFactory, profileOverride, url } = options;
 
   // Generate stream identifiers early so all log messages include them.
   const streamId = generateStreamId(channelName, url);
@@ -687,7 +748,7 @@ export async function setupStream(options: StreamSetupOptions, onCircuitBreak: (
 
           profileResult = redirectResult;
 
-          LOG.info("Resolved redirect for profile detection: %s → %s (%s).", urlToResolve, resolvedUrl, redirectResult.profileName);
+          LOG.debug("streaming:setup", "Resolved redirect for profile detection: %s → %s (%s).", urlToResolve, resolvedUrl, redirectResult.profileName);
         }
       }
     }
@@ -709,7 +770,7 @@ export async function setupStream(options: StreamSetupOptions, onCircuitBreak: (
         profile = resolveProfile(profileOverride);
         profileName = profileOverride;
 
-        LOG.info("Profile overridden to '%s' via query parameter.", profileOverride);
+        LOG.debug("streaming:setup", "Profile overridden to '%s' via query parameter.", profileOverride);
       } else {
 
         LOG.warn("Unknown profile override '%s', using resolved profile.", profileOverride);
@@ -729,8 +790,18 @@ export async function setupStream(options: StreamSetupOptions, onCircuitBreak: (
       profile = { ...profile, channelSelector };
     }
 
+    // Merge the ad-hoc clickToPlay and clickSelector options into the profile. clickSelector implies clickToPlay. For ad-hoc streams, these enable clicking an
+    // element to start playback - either the video element (clickToPlay alone) or a play button overlay (clickToPlay + clickSelector).
+    if(clickToPlay || clickSelector) {
+
+      profile = { ...profile, clickToPlay: true, ...(clickSelector ? { clickSelector } : {}) };
+    }
+
     // Compute the metadata comment for FFmpeg. Prefer the friendly channel name, fall back to the channel key, or extract the domain from the URL.
     const metadataComment = channel?.name ?? channelName ?? extractDomain(url);
+
+    // Compute the friendly provider display name once for use in both the monitor and the setup result.
+    const providerName = getProviderDisplayName(url);
 
     // Create the tab replacement handler if a factory was provided. This is done after profile resolution so the handler has access to the final profile.
     const onTabReplacement = onTabReplacementFactory ? onTabReplacementFactory(numericStreamId, streamId, profile, metadataComment) : undefined;
@@ -793,13 +864,14 @@ export async function setupStream(options: StreamSetupOptions, onCircuitBreak: (
       throw new StreamSetupError("Stream error.", isCaptureError ? 503 : 500, "Failed to start stream.");
     }
 
-    const { captureStream, context, ffmpegProcess, page, rawCaptureStream } = captureResult;
+    const { captureStream, context, directTune, ffmpegProcess, page, rawCaptureStream } = captureResult;
 
     // Monitor stream info for status updates.
     const monitorStreamInfo: MonitorStreamInfo = {
 
       channelName: channel?.name ?? null,
       numericStreamId,
+      providerName,
       startTime
     };
 
@@ -840,9 +912,9 @@ export async function setupStream(options: StreamSetupOptions, onCircuitBreak: (
       // Close the browser page (fire-and-forget to avoid blocking on stuck pages).
       if(!page.isClosed()) {
 
-        page.close().catch((error) => {
+        page.close().catch((error: unknown) => {
 
-          LOG.warn("Page close error during cleanup: %s.", formatError(error));
+          LOG.debug("streaming:setup", "Page close error during cleanup: %s.", formatError(error));
         });
       }
 
@@ -856,11 +928,13 @@ export async function setupStream(options: StreamSetupOptions, onCircuitBreak: (
       captureStream,
       channelName: channel?.name ?? null,
       cleanup,
+      directTune,
       ffmpegProcess,
       numericStreamId,
       page,
       profile,
       profileName,
+      providerName,
       rawCaptureStream,
       startTime,
       stopMonitor,
@@ -868,4 +942,147 @@ export async function setupStream(options: StreamSetupOptions, onCircuitBreak: (
       url
     };
   });
+}
+
+// Startup Capture Verification.
+
+/**
+ * Verifies that Chrome's capture system is functional before the server starts accepting requests. This detects stale tabCapture state left over from a previous
+ * Chrome process — common during quick service restarts where the old process hasn't fully exited before the new one launches. Without this probe, the first stream
+ * request would trigger the runtime stale capture handler, which exits the process because the puppeteer-stream mutex is permanently leaked.
+ *
+ * The probe creates a temporary page, attempts a short capture, and tears down both cleanly. A 500ms delay after destroying the capture stream allows
+ * puppeteer-stream's fire-and-forget STOP_RECORDING chain to complete before closing the page, preventing the stale capture cascade on the first real request.
+ *
+ * After a system reboot, Chrome's display stack or capture extension may not be ready when the service manager starts PrismCast. The probe retries up to
+ * PROBE_MAX_ATTEMPTS times with a delay between attempts, giving the system time to settle before giving up. This prevents a rapid restart storm where the service
+ * manager relaunches PrismCast repeatedly, each attempt orphaning a Chrome process and degrading the environment further.
+ *
+ * If stale capture state is detected, the process exits immediately — Chrome restart cannot fix the leaked mutex, only a fresh process can.
+ */
+export async function verifyCaptureSystem(): Promise<void> {
+
+  const PROBE_MAX_ATTEMPTS = 3;
+  const PROBE_RETRY_DELAY = 5000;
+  const PROBE_TIMEOUT = 5000;
+
+  for(let attempt = 1; attempt <= PROBE_MAX_ATTEMPTS; attempt++) {
+
+    // eslint-disable-next-line no-await-in-loop -- Sequential retries are intentional; each probe must complete before deciding whether to retry.
+    const result = await attemptCaptureProbe(PROBE_TIMEOUT);
+
+    // Probe succeeded.
+    if(result === null) {
+
+      return;
+    }
+
+    // Stale capture state is unrecoverable. The error occurs inside puppeteer-stream's second lock section, which has no try/finally — the internal mutex is
+    // permanently leaked. All subsequent getStream() calls will hang on it. Chrome restart cannot fix module-level state, so exit and let the service manager
+    // restart with a clean process.
+    if(result.includes("Cannot capture a tab with an active stream")) {
+
+      LOG.error("Startup probe detected stale capture state. puppeteer-stream's internal capture mutex is now permanently locked. Exiting so the service " +
+        "manager can restart with a clean module state.");
+
+      process.exit(1);
+    }
+
+    // If we have retries remaining, log a warning and wait before the next attempt.
+    if(attempt < PROBE_MAX_ATTEMPTS) {
+
+      LOG.warn("Capture probe attempt %d of %d failed: %s. Retrying in %ds.", attempt, PROBE_MAX_ATTEMPTS, result, PROBE_RETRY_DELAY / 1000);
+
+      // eslint-disable-next-line no-await-in-loop -- Deliberate delay between sequential retry attempts.
+      await delay(PROBE_RETRY_DELAY);
+    } else {
+
+      throw new Error("Capture system verification failed after " + String(PROBE_MAX_ATTEMPTS) + " attempts: " + result);
+    }
+  }
+}
+
+/**
+ * Executes a single capture probe attempt. Creates a temporary page, tries to start a capture stream, and tears everything down cleanly.
+ * @param timeout - Maximum time in milliseconds to wait for getStream() to respond.
+ * @returns Null on success, or an error message string on failure.
+ */
+async function attemptCaptureProbe(timeout: number): Promise<Nullable<string>> {
+
+  const browser = await getCurrentBrowser();
+  const page = await browser.newPage();
+
+  registerManagedPage(page);
+
+  try {
+
+    // Use the same capture MIME type and viewport constraints as the runtime. The stale state error occurs at the tabCapture API level before encoding matters,
+    // but matching the runtime configuration ensures the probe exercises the exact same getStream() parameters.
+    const useFFmpeg = CONFIG.streaming.captureMode === "ffmpeg";
+    const captureMimeType = useFFmpeg ? WEBM_FFMPEG_MIME_TYPE : NATIVE_FMP4_MIME_TYPE;
+
+    const streamOptions = {
+
+      audio: true,
+      mimeType: captureMimeType,
+      video: true,
+      videoConstraints: {
+
+        mandatory: {
+
+          maxFrameRate: 30,
+          maxHeight: getEffectiveViewport(CONFIG).height,
+          maxWidth: getEffectiveViewport(CONFIG).width,
+          minFrameRate: 30,
+          minHeight: getEffectiveViewport(CONFIG).height,
+          minWidth: getEffectiveViewport(CONFIG).width
+        }
+      }
+    } as unknown as Parameters<typeof getStream>[1];
+
+    const stream = await Promise.race([
+      getStream(page, streamOptions),
+      new Promise<never>((_, reject) => {
+
+        setTimeout(() => {
+
+          reject(new Error("Capture probe timed out."));
+        }, timeout);
+      })
+    ]);
+
+    // Capture succeeded — the system is functional. Destroy the stream before closing the page to ensure chrome.tabCapture releases the capture cleanly.
+    const readable = stream as unknown as Readable;
+
+    readable.destroy();
+
+    // Wait for puppeteer-stream's capture cleanup chain to complete. readable.destroy() triggers STOP_RECORDING via the close handler, but the call is
+    // fire-and-forget. The async chain (STOP_RECORDING → recorder.stop() → onstop → track.stop()) must finish before closing the page, or Chrome's tabCapture
+    // state may linger and cause "Cannot capture a tab with an active stream" errors on the first real stream request.
+    await delay(500);
+
+    unregisterManagedPage(page);
+
+    if(!page.isClosed()) {
+
+      await page.close();
+    }
+
+    LOG.info("Capture system verified successfully.");
+
+    return null;
+  } catch(error) {
+
+    const errorMessage = formatError(error);
+
+    // Clean up the test page.
+    unregisterManagedPage(page);
+
+    if(!page.isClosed()) {
+
+      page.close().catch(() => { /* Fire-and-forget during error cleanup. */ });
+    }
+
+    return errorMessage;
+  }
 }

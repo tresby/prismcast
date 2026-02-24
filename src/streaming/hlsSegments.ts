@@ -7,10 +7,7 @@ import { LOG } from "../utils/index.js";
 import type { StreamRegistryEntry } from "./registry.js";
 import { getStream } from "./registry.js";
 
-/*
- * HLS SEGMENT STORAGE
- *
- * This module provides functions for storing and retrieving HLS segments, playlists, and init segments. All data is stored in the stream registry's HLSState, which is
+/* This module provides functions for storing and retrieving HLS segments, playlists, and init segments. All data is stored in the stream registry's HLSState, which is
  * the single source of truth for stream data. Key responsibilities:
  *
  * 1. Store init segment, media segments, and playlists per stream
@@ -40,7 +37,7 @@ export function storeSegment(streamId: number, filename: string, data: Buffer): 
 
   if(!stream) {
 
-    LOG.warn("Attempted to store segment for unknown stream %s.", streamId);
+    LOG.debug("streaming:hls", "Attempted to store segment for unknown stream %s.", streamId);
 
     return;
   }
@@ -53,7 +50,12 @@ export function storeSegment(streamId: number, filename: string, data: Buffer): 
   // Enforce segment limit by removing oldest segments. JavaScript Maps maintain insertion order, so the first key is always the oldest segment.
   while(stream.hls.segments.size > CONFIG.hls.maxSegments) {
 
-    const oldestKey = stream.hls.segments.keys().next().value as string;
+    const oldestKey = stream.hls.segments.keys().next().value;
+
+    if(oldestKey === undefined) {
+
+      break;
+    }
 
     stream.hls.segments.delete(oldestKey);
   }
@@ -91,7 +93,7 @@ export function storeInitSegment(streamId: number, data: Buffer): void {
 
   if(!stream) {
 
-    LOG.warn("Attempted to store init segment for unknown stream %s.", streamId);
+    LOG.debug("streaming:hls", "Attempted to store init segment for unknown stream %s.", streamId);
 
     return;
   }
@@ -106,6 +108,10 @@ export function storeInitSegment(streamId: number, data: Buffer): void {
   if(isFirstInit) {
 
     stream.hls.signalInitSegmentReady();
+
+    const elapsed = ((Date.now() - stream.startTime.getTime()) / 1000).toFixed(3);
+
+    LOG.debug("timing:startup", "Init segment ready in %ss.", elapsed);
   }
 }
 
@@ -139,7 +145,7 @@ export function updatePlaylist(streamId: number, content: string): void {
 
   if(!stream) {
 
-    LOG.warn("Attempted to update playlist for unknown stream %s.", streamId);
+    LOG.debug("streaming:hls", "Attempted to update playlist for unknown stream %s.", streamId);
 
     return;
   }
@@ -151,6 +157,10 @@ export function updatePlaylist(streamId: number, content: string): void {
   if(isFirstPlaylist) {
 
     stream.hls.signalPlaylistReady();
+
+    const elapsed = ((Date.now() - stream.startTime.getTime()) / 1000).toFixed(3);
+
+    LOG.debug("timing:startup", "First playlist ready in %ss.", elapsed);
   }
 }
 
@@ -207,7 +217,7 @@ async function waitForReady(streamId: number, getPromise: (stream: StreamRegistr
 
   const timeoutPromise = new Promise<boolean>((resolve) => {
 
-    setTimeout(() => resolve(false), timeout);
+    setTimeout(() => { resolve(false); }, timeout);
   });
 
   const readyPromise = getPromise(stream).then(() => true);

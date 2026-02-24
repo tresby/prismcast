@@ -11,10 +11,7 @@ import fs from "node:fs";
 
 const { promises: fsPromises } = fs;
 
-/*
- * SERVICE FILE GENERATORS
- *
- * These generators create platform-specific service definitions that allow PrismCast to run as a managed service. Each generator produces the appropriate
+/* These generators create platform-specific service definitions that allow PrismCast to run as a managed service. Each generator produces the appropriate
  * configuration format for its service manager (launchd plist for macOS, systemd unit for Linux, Task Scheduler task for Windows).
  *
  * Key features of generated services:
@@ -69,13 +66,10 @@ export interface ServiceGenerator {
   uninstall(): Promise<void>;
 }
 
-/*
- * MACOS LAUNCHD GENERATOR
- *
- * Generates a launchd property list (plist) file for macOS. The plist is installed to ~/Library/LaunchAgents/ and configured with:
+/* Generates a launchd property list (plist) file for macOS. The plist is installed to ~/Library/LaunchAgents/ and configured with:
  * - RunAtLoad: Start when user logs in
  * - KeepAlive: Restart automatically if the process exits
- * - StandardOutPath/StandardErrorPath: Capture stdout/stderr to ~/.prismcast/logs/
+ * - StandardOutPath/StandardErrorPath: Capture stdout/stderr to the data directory
  */
 
 /**
@@ -85,12 +79,7 @@ export interface ServiceGenerator {
  */
 function escapeXml(str: string): string {
 
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 }
 
 /**
@@ -197,11 +186,13 @@ function createLaunchdGenerator(): ServiceGenerator {
       }
     },
 
+    // eslint-disable-next-line @typescript-eslint/require-await
     async isInstalled(): Promise<boolean> {
 
-      return await Promise.resolve(fs.existsSync(this.getInstallPath()));
+      return fs.existsSync(this.getInstallPath());
     },
 
+    // eslint-disable-next-line @typescript-eslint/require-await
     async isRunning(): Promise<boolean> {
 
       try {
@@ -213,10 +204,10 @@ function createLaunchdGenerator(): ServiceGenerator {
         const pid = result.trim().split("\t")[0];
 
         // PID is "-" when loaded but process not running, or a number when actually running.
-        return await Promise.resolve((pid !== "-") && !isNaN(Number(pid)));
+        return (pid !== "-") && !isNaN(Number(pid));
       } catch {
 
-        return await Promise.resolve(false);
+        return false;
       }
     },
 
@@ -224,6 +215,7 @@ function createLaunchdGenerator(): ServiceGenerator {
 
     serviceManager: "launchd",
 
+    // eslint-disable-next-line @typescript-eslint/require-await
     async start(): Promise<void> {
 
       const installPath = this.getInstallPath();
@@ -239,17 +231,14 @@ function createLaunchdGenerator(): ServiceGenerator {
 
       // Explicitly start the service. This handles the case where the plist is loaded but the process isn't running (e.g., after a crash).
       execSync("launchctl start " + SERVICE_ID, { stdio: "pipe" });
-
-      await Promise.resolve();
     },
 
+    // eslint-disable-next-line @typescript-eslint/require-await
     async stop(): Promise<void> {
 
       const installPath = this.getInstallPath();
 
       execSync("launchctl unload \"" + installPath + "\"", { stdio: "pipe" });
-
-      await Promise.resolve();
     },
 
     async uninstall(): Promise<void> {
@@ -274,10 +263,7 @@ function createLaunchdGenerator(): ServiceGenerator {
   };
 }
 
-/*
- * LINUX SYSTEMD GENERATOR
- *
- * Generates a systemd user service unit file for Linux. The unit is installed to ~/.config/systemd/user/ and configured with:
+/* Generates a systemd user service unit file for Linux. The unit is installed to ~/.config/systemd/user/ and configured with:
  * - Restart=always: Restart automatically if the process exits
  * - RestartSec=5: Wait 5 seconds before restarting
  * - WantedBy=default.target: Start when user session begins
@@ -301,10 +287,7 @@ function createSystemdGenerator(): ServiceGenerator {
       const envVars: Record<string, string> = { PRISMCAST_SERVICE: "1", ...options.envVars };
 
       // Generate Environment= lines, sorted alphabetically.
-      const envLines = Object.entries(envVars)
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([ key, value ]) => "Environment=\"" + key + "=" + value + "\"")
-        .join("\n");
+      const envLines = Object.entries(envVars).sort(([a], [b]) => a.localeCompare(b)).map(([ key, value ]) => "Environment=\"" + key + "=" + value + "\"").join("\n");
 
       // Generate the unit file content.
       return [
@@ -358,21 +341,23 @@ function createSystemdGenerator(): ServiceGenerator {
       execSync("systemctl --user start prismcast.service", { stdio: "pipe" });
     },
 
+    // eslint-disable-next-line @typescript-eslint/require-await
     async isInstalled(): Promise<boolean> {
 
-      return await Promise.resolve(fs.existsSync(this.getInstallPath()));
+      return fs.existsSync(this.getInstallPath());
     },
 
+    // eslint-disable-next-line @typescript-eslint/require-await
     async isRunning(): Promise<boolean> {
 
       try {
 
         const result = execSync("systemctl --user is-active prismcast.service", { encoding: "utf8", stdio: "pipe" });
 
-        return await Promise.resolve(result.trim() === "active");
+        return result.trim() === "active";
       } catch {
 
-        return await Promise.resolve(false);
+        return false;
       }
     },
 
@@ -380,18 +365,16 @@ function createSystemdGenerator(): ServiceGenerator {
 
     serviceManager: "systemd",
 
+    // eslint-disable-next-line @typescript-eslint/require-await
     async start(): Promise<void> {
 
       execSync("systemctl --user start prismcast.service", { stdio: "pipe" });
-
-      await Promise.resolve();
     },
 
+    // eslint-disable-next-line @typescript-eslint/require-await
     async stop(): Promise<void> {
 
       execSync("systemctl --user stop prismcast.service", { stdio: "pipe" });
-
-      await Promise.resolve();
     },
 
     async uninstall(): Promise<void> {
@@ -433,10 +416,7 @@ function createSystemdGenerator(): ServiceGenerator {
   };
 }
 
-/*
- * WINDOWS TASK SCHEDULER GENERATOR
- *
- * Uses Windows Task Scheduler via schtasks.exe to create a task that runs at user logon. Unlike launchd and systemd, Task Scheduler doesn't have built-in process
+/* Uses Windows Task Scheduler via schtasks.exe to create a task that runs at user logon. Unlike launchd and systemd, Task Scheduler doesn't have built-in process
  * supervision, so we configure the task to restart on failure. A marker file is used to track installation state.
  */
 
@@ -460,10 +440,7 @@ function createWindowsSchedulerGenerator(): ServiceGenerator {
       const envVars: Record<string, string> = { PRISMCAST_SERVICE: "1", ...options.envVars };
 
       // Generate environment variable SET commands.
-      const envSets = Object.entries(envVars)
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([ key, value ]) => "set \"" + key + "=" + value + "\"")
-        .join(" && ");
+      const envSets = Object.entries(envVars).sort(([a], [b]) => a.localeCompare(b)).map(([ key, value ]) => "set \"" + key + "=" + value + "\"").join(" && ");
 
       // Return the command to run (used by install).
       return "cmd /c \"cd /d \"" + workingDir + "\" && " + envSets + " && \"" + nodePath + "\" \"" + entryPoint + "\"\"";
@@ -511,29 +488,31 @@ function createWindowsSchedulerGenerator(): ServiceGenerator {
       }
     },
 
+    // eslint-disable-next-line @typescript-eslint/require-await
     async isInstalled(): Promise<boolean> {
 
       try {
 
         execSync("schtasks /Query /TN \"" + taskName + "\"", { stdio: "pipe" });
 
-        return await Promise.resolve(true);
+        return true;
       } catch {
 
-        return await Promise.resolve(false);
+        return false;
       }
     },
 
+    // eslint-disable-next-line @typescript-eslint/require-await
     async isRunning(): Promise<boolean> {
 
       try {
 
         const result = execSync("schtasks /Query /TN \"" + taskName + "\" /FO CSV /NH", { encoding: "utf8", stdio: "pipe" });
 
-        return await Promise.resolve(result.includes("Running"));
+        return result.includes("Running");
       } catch {
 
-        return await Promise.resolve(false);
+        return false;
       }
     },
 
@@ -541,18 +520,16 @@ function createWindowsSchedulerGenerator(): ServiceGenerator {
 
     serviceManager: "windows-scheduler",
 
+    // eslint-disable-next-line @typescript-eslint/require-await
     async start(): Promise<void> {
 
       execSync("schtasks /Run /TN \"" + taskName + "\"", { stdio: "pipe" });
-
-      await Promise.resolve();
     },
 
+    // eslint-disable-next-line @typescript-eslint/require-await
     async stop(): Promise<void> {
 
       execSync("schtasks /End /TN \"" + taskName + "\"", { stdio: "pipe" });
-
-      await Promise.resolve();
     },
 
     async uninstall(): Promise<void> {
@@ -577,10 +554,7 @@ function createWindowsSchedulerGenerator(): ServiceGenerator {
   };
 }
 
-/*
- * GENERATOR FACTORY
- *
- * Returns the appropriate service generator for the current platform.
+/* Returns the appropriate service generator for the current platform.
  */
 
 /**
@@ -635,6 +609,12 @@ export function collectServiceEnvironment(): Record<string, string> {
     "CHROME_BIN",
     "FRAME_RATE",
     "HOST",
+    "LOG_MAX_SIZE",
+    "PORT",
+    "PRISMCAST_CHROME_DATA_DIR",
+    "PRISMCAST_DATA_DIR",
+    "PRISMCAST_DEBUG",
+    "PRISMCAST_LOG_FILE",
     "QUALITY_PRESET",
     "VIDEO_BITRATE"
   ];

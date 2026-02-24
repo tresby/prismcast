@@ -3,32 +3,27 @@
  * userConfig.ts: User configuration file management for PrismCast.
  */
 import type { Config, Nullable } from "../types/index.js";
+import { getConfigFilePath, getDataDir } from "./paths.js";
+import type { CliOverrides } from "./index.js";
 import { LOG } from "../utils/index.js";
 import fs from "node:fs";
 import { getValidPresetIds } from "./presets.js";
-import os from "node:os";
-import path from "node:path";
 
 const { promises: fsPromises } = fs;
 
-/*
- * USER CONFIGURATION FILE
+/* PrismCast stores user configuration in config.json inside the data directory (default: ~/.prismcast). This file allows users to customize settings without using
+ * environment variables or CLI flags. The configuration system uses a layered approach with the following priority (highest to lowest):
  *
- * PrismCast stores user configuration in ~/.prismcast/config.json. This file allows users to customize settings without using environment variables. The
- * configuration system uses a layered approach:
+ * 1. CLI flags (--port, --chrome-data-dir, --log-file)
+ * 2. Environment variables (SCREAMING_SNAKE_CASE naming)
+ * 3. User config file (config.json in data directory)
+ * 4. Hard-coded defaults (defined in DEFAULTS)
  *
- * 1. Hard-coded defaults (defined in DEFAULTS)
- * 2. User config file (~/.prismcast/config.json)
- * 3. Environment variables (highest priority)
- *
- * This design allows Docker deployments to use environment variables to override user settings, while standalone installations can use the config file for
- * convenience. The web UI at /config provides a user-friendly interface for editing the config file.
+ * This design follows the standard convention where CLI flags override everything. Docker deployments can use environment variables, standalone installations can
+ * use the config file via the web UI at /config, and operators can always override any setting with a CLI flag.
  */
 
-/*
- * SETTING METADATA
- *
- * Each configurable setting has metadata describing its type, valid range, environment variable name, and human-readable description. This metadata is used by the
+/* Each configurable setting has metadata describing its type, valid range, environment variable name, and human-readable description. This metadata is used by the
  * /config web UI to render appropriate form fields and validation, and by the validation system to check values before saving.
  */
 
@@ -45,6 +40,10 @@ export interface SettingMetadata {
   // UI. The field values are still submitted during save to avoid losing custom values when the parent toggle is temporarily disabled.
   dependsOn?: string;
 
+  // When set, the field is disabled in the UI and this message is shown as a warning explaining why. The setting's value is forced to its default and cannot be
+  // changed by the user. Used for temporarily disabling options due to upstream issues (e.g., Chrome bugs).
+  disabledReason?: string;
+
   // Divisor for converting stored value to display value (e.g., 1000 to convert ms to seconds). When set, the UI displays value/displayDivisor and stores
   // submittedValue*displayDivisor.
   displayDivisor?: number;
@@ -56,7 +55,7 @@ export interface SettingMetadata {
   displayUnit?: string;
 
   // Environment variable that can override this setting, or null if not overridable.
-  envVar: string | null;
+  envVar: Nullable<string>;
 
   // Human-readable label for form fields.
   label: string;
@@ -200,10 +199,30 @@ export const CONFIG_METADATA: Record<string, SettingMetadata[]> = {
       envVar: "LOG_MAX_SIZE",
       label: "Max Log Size",
       max: 104857600,
-      min: 10240,
+      min: 524288,
       path: "logging.maxSize",
       type: "integer",
       unit: "bytes"
+    }
+  ],
+
+  paths: [
+    {
+
+      description: "Absolute path override for Chrome's user data directory. When set, Chrome profile data is stored at this path instead of the default " +
+        "location inside the data directory. Useful for placing Chrome data on a different volume.",
+      envVar: "PRISMCAST_CHROME_DATA_DIR",
+      label: "Chrome Data Directory",
+      path: "paths.chromeDataDir",
+      type: "path"
+    },
+    {
+
+      description: "Absolute path override for the log file. When set, logs are written to this path instead of the default location inside the data directory.",
+      envVar: "PRISMCAST_LOG_FILE",
+      label: "Log File Path",
+      path: "paths.logFile",
+      type: "path"
     }
   ],
 
@@ -463,6 +482,8 @@ export const CONFIG_METADATA: Record<string, SettingMetadata[]> = {
 
       description: "FFmpeg (recommended) provides reliable capture for long recordings. Native mode captures directly from Chrome without an external " +
         "process, but may require stream recovery after 20-30 minutes of continuous use.",
+      disabledReason: "Native capture mode is temporarily disabled due to a Chrome bug that causes fMP4 MediaRecorder to produce corrupt output after " +
+        "20-30 minutes of continuous recording. FFmpeg mode is required until a future Chrome release resolves this issue.",
       envVar: "CAPTURE_MODE",
       label: "Capture Mode",
       path: "streaming.captureMode",
@@ -496,8 +517,8 @@ export const CONFIG_METADATA: Record<string, SettingMetadata[]> = {
       description: "Target frame rate. 60fps is ideal for sports; 30fps works for most TV content.",
       envVar: "FRAME_RATE",
       label: "Frame Rate",
-      max: 120,
-      min: 15,
+      max: 60,
+      min: 30,
       path: "streaming.frameRate",
       type: "integer",
       unit: "fps"
@@ -564,10 +585,7 @@ export const CONFIG_METADATA: Record<string, SettingMetadata[]> = {
   ]
 };
 
-/*
- * USER CONFIG TYPES
- *
- * The user config file stores partial configuration - only the settings that differ from defaults. All fields are optional because missing fields use defaults.
+/* The user config file stores partial configuration - only the settings that differ from defaults. All fields are optional because missing fields use defaults.
  */
 
 /**
@@ -594,6 +612,7 @@ export interface UserHLSConfig {
  */
 export interface UserLoggingConfig {
 
+  debugFilter?: string;
   maxSize?: number;
 }
 
@@ -661,6 +680,9 @@ export interface UserChannelsConfig {
 
   // List of predefined channel keys that are disabled.
   disabledPredefined?: string[];
+
+  // Provider tags that are enabled for filtering. Empty means no filter.
+  enabledProviders?: string[];
 }
 
 /**
@@ -675,6 +697,15 @@ export interface UserHdhrConfig {
 }
 
 /**
+ * Partial paths configuration for user config file.
+ */
+export interface UserPathsConfig {
+
+  chromeDataDir?: Nullable<string>;
+  logFile?: Nullable<string>;
+}
+
+/**
  * User configuration with all fields optional. This is the structure of the config.json file.
  */
 export interface UserConfig {
@@ -684,6 +715,7 @@ export interface UserConfig {
   hdhr?: UserHdhrConfig;
   hls?: UserHLSConfig;
   logging?: UserLoggingConfig;
+  paths?: UserPathsConfig;
   playback?: UserPlaybackConfig;
   recovery?: UserRecoveryConfig;
   server?: UserServerConfig;
@@ -705,28 +737,10 @@ export interface UserConfigLoadResult {
   parseErrorMessage?: string;
 }
 
-/*
- * CONFIG FILE PATH
- *
- * The config file is stored in the same data directory as the Chrome profile (~/.prismcast).
+/* The config file path is resolved via the centralized paths module (config/paths.ts). The data directory is initialized at startup before config loading.
  */
 
-const dataDir = path.join(os.homedir(), ".prismcast");
-const configFilePath = path.join(dataDir, "config.json");
-
-/**
- * Returns the path to the user configuration file.
- * @returns The absolute path to ~/.prismcast/config.json.
- */
-export function getConfigFilePath(): string {
-
-  return configFilePath;
-}
-
-/*
- * CONFIG FILE OPERATIONS
- *
- * These functions handle reading and writing the config file. All operations are async and handle errors gracefully.
+/* These functions handle reading and writing the config file. All operations are async and handle errors gracefully.
  */
 
 /**
@@ -738,7 +752,7 @@ export async function loadUserConfig(): Promise<UserConfigLoadResult> {
 
   try {
 
-    const content = await fsPromises.readFile(configFilePath, "utf-8");
+    const content = await fsPromises.readFile(getConfigFilePath(), "utf-8");
 
     try {
 
@@ -749,7 +763,7 @@ export async function loadUserConfig(): Promise<UserConfigLoadResult> {
 
       const message = (parseError instanceof Error) ? parseError.message : String(parseError);
 
-      LOG.warn("Invalid JSON in configuration file %s: %s. Using defaults.", configFilePath, message);
+      LOG.warn("Invalid JSON in configuration file %s: %s. Using defaults.", getConfigFilePath(), message);
 
       return { config: {}, parseError: true, parseErrorMessage: message };
     }
@@ -762,7 +776,7 @@ export async function loadUserConfig(): Promise<UserConfigLoadResult> {
     }
 
     // Other read errors - log and use defaults.
-    LOG.warn("Failed to read configuration file %s: %s. Using defaults.", configFilePath, (error instanceof Error) ? error.message : String(error));
+    LOG.warn("Failed to read configuration file %s: %s. Using defaults.", getConfigFilePath(), (error instanceof Error) ? error.message : String(error));
 
     return { config: {}, parseError: false };
   }
@@ -776,20 +790,17 @@ export async function loadUserConfig(): Promise<UserConfigLoadResult> {
 export async function saveUserConfig(config: UserConfig): Promise<void> {
 
   // Ensure data directory exists.
-  await fsPromises.mkdir(dataDir, { recursive: true });
+  await fsPromises.mkdir(getDataDir(), { recursive: true });
 
   // Write config with pretty formatting for readability.
   const content = JSON.stringify(config, null, 2);
 
-  await fsPromises.writeFile(configFilePath, content + "\n", "utf-8");
+  await fsPromises.writeFile(getConfigFilePath(), content + "\n", "utf-8");
 
-  LOG.info("Configuration saved to %s.", configFilePath);
+  LOG.info("Configuration saved to %s.", getConfigFilePath());
 }
 
-/*
- * ENVIRONMENT VARIABLE DETECTION
- *
- * These functions detect which settings are overridden by environment variables, so the UI can disable those fields and show appropriate warnings.
+/* These functions detect which settings are overridden by environment variables, so the UI can disable those fields and show appropriate warnings.
  */
 
 /**
@@ -816,10 +827,7 @@ export function getEnvOverrides(): Map<string, string> {
   return overrides;
 }
 
-/*
- * CONFIGURATION MERGING
- *
- * These functions merge defaults, user config, and environment overrides into the final CONFIG object.
+/* These functions merge defaults, user config, and environment overrides into the final CONFIG object.
  */
 
 /**
@@ -835,7 +843,8 @@ export const DEFAULTS: Config = {
 
   channels: {
 
-    disabledPredefined: []
+    disabledPredefined: [],
+    enabledProviders: []
   },
 
   hdhr: {
@@ -855,22 +864,23 @@ export const DEFAULTS: Config = {
 
   logging: {
 
+    debugFilter: "",
     httpLogLevel: "errors",
     maxSize: 1048576
   },
 
   paths: {
 
-
+    chromeDataDir: null,
     chromeProfileName: "chromedata",
-    extensionDirName: "extension"
+    extensionDirName: "extension",
+    logFile: null
   },
 
   playback: {
 
-
     bufferingGracePeriod: 10000,
-    channelSelectorDelay: 3000,
+    channelSelectorDelay: 5000,
     channelSwitchDelay: 4000,
     clickToPlayDelay: 1000,
     iframeInitDelay: 1500,
@@ -885,7 +895,6 @@ export const DEFAULTS: Config = {
 
   recovery: {
 
-
     backoffJitter: 1000,
     circuitBreakerThreshold: 10,
     circuitBreakerWindow: 300000,
@@ -895,7 +904,6 @@ export const DEFAULTS: Config = {
   },
 
   server: {
-
 
     host: "0.0.0.0",
     port: 5589
@@ -911,7 +919,7 @@ export const DEFAULTS: Config = {
     navigationTimeout: 10000,
     qualityPreset: "720p-high",
     videoBitsPerSecond: 12000000,
-    videoTimeout: 10000
+    videoTimeout: 11000
   }
 };
 
@@ -948,10 +956,15 @@ function parseEnvValue(value: string, type: SettingMetadata["type"]): Nullable<b
       return Number.isNaN(num) ? undefined : num;
     }
 
-    case "host":
-    case "path": {
+    case "host": {
 
       return value;
+    }
+
+    case "path": {
+
+      // An empty path env var means "use default" — return null so the downstream code sees the same sentinel as an unset config field.
+      return (value.trim() === "") ? null : value;
     }
 
     default: {
@@ -1012,11 +1025,13 @@ export function setNestedValue(obj: Record<string, unknown>, settingPath: string
 }
 
 /**
- * Merges user configuration with defaults and environment overrides to produce the final configuration. Priority: env vars > user config > defaults.
+ * Merges user configuration with defaults, environment overrides, and CLI overrides to produce the final configuration.
+ * Priority (highest to lowest): CLI overrides > env vars > user config > defaults.
  * @param userConfig - User configuration from the config file.
+ * @param cliOverrides - Optional CLI flag overrides, applied at the highest priority level.
  * @returns The merged configuration.
  */
-export function mergeConfiguration(userConfig: UserConfig): Config {
+export function mergeConfiguration(userConfig: UserConfig, cliOverrides?: CliOverrides): Config {
 
   // Start with a deep copy of defaults.
   const config = JSON.parse(JSON.stringify(DEFAULTS)) as Config;
@@ -1035,13 +1050,18 @@ export function mergeConfiguration(userConfig: UserConfig): Config {
     }
   }
 
-  /* NON-CONFIG_METADATA FIELDS — These fields are stored in the user config file but are not part of CONFIG_METADATA because they are complex types (arrays,
-   * auto-generated strings) that don't fit the standard scalar setting model. When adding a new field here, you MUST also add corresponding logic in
-   * filterDefaults() below to preserve it during save. The filterDefaults() counterpart is marked with the same "NON-CONFIG_METADATA FIELDS" heading.
+  /* These fields are stored in the user config file but are not part of CONFIG_METADATA because they are complex types (arrays, auto-generated strings) that don't
+   * fit the standard scalar setting model. When adding a new field here, you must also add corresponding preservation logic in filterDefaults() below AND in the
+   * POST /config handler in routes/config.ts (which must carry forward these fields from the existing file so the settings form doesn't wipe them).
    */
   if(Array.isArray(userConfig.channels?.disabledPredefined)) {
 
     config.channels.disabledPredefined = [...userConfig.channels.disabledPredefined];
+  }
+
+  if(Array.isArray(userConfig.channels?.enabledProviders)) {
+
+    config.channels.enabledProviders = [...userConfig.channels.enabledProviders];
   }
 
   if((typeof userConfig.hdhr?.deviceId === "string") && (userConfig.hdhr.deviceId.length > 0)) {
@@ -1049,7 +1069,12 @@ export function mergeConfiguration(userConfig: UserConfig): Config {
     config.hdhr.deviceId = userConfig.hdhr.deviceId;
   }
 
-  // Apply environment variable overrides (highest priority).
+  if((typeof userConfig.logging?.debugFilter === "string") && (userConfig.logging.debugFilter.length > 0)) {
+
+    config.logging.debugFilter = userConfig.logging.debugFilter;
+  }
+
+  // Apply environment variable overrides.
   for(const settings of Object.values(CONFIG_METADATA)) {
 
     for(const setting of settings) {
@@ -1068,13 +1093,22 @@ export function mergeConfiguration(userConfig: UserConfig): Config {
     }
   }
 
+  // Apply CLI overrides (highest priority). These are already parsed values keyed by CONFIG_METADATA paths.
+  if(cliOverrides) {
+
+    for(const [ overridePath, value ] of Object.entries(cliOverrides)) {
+
+      if(value !== undefined) {
+
+        setNestedValue(config as unknown as Record<string, unknown>, overridePath, value);
+      }
+    }
+  }
+
   return config;
 }
 
-/*
- * UI TAB CONFIGURATION
- *
- * The configuration UI uses a simplified two-tab structure: Settings (common options) and Advanced (expert tuning). Rather than annotating every setting with UI
+/* The configuration UI uses a simplified two-tab structure: Settings (common options) and Advanced (expert tuning). Rather than annotating every setting with UI
  * placement, we explicitly list the Settings tab contents and derive everything else.
  *
  * Architecture:
@@ -1133,8 +1167,7 @@ export interface AdvancedSection {
  */
 export type SettingsSection = AdvancedSection;
 
-/*
- * The settings "promoted" to the main Settings tab, organized into visual sections. These are the options most users might actually change. Everything else goes to
+/* The settings "promoted" to the main Settings tab, organized into visual sections. These are the options most users might actually change. Everything else goes to
  * the Advanced tab, grouped by storage category. Sections are displayed in array order.
  */
 const SETTINGS_TAB_SECTIONS: { displayName: string; id: string; paths: string[] }[] = [
@@ -1165,13 +1198,13 @@ const SETTINGS_TAB_SECTIONS: { displayName: string; id: string; paths: string[] 
   }
 ];
 
-/*
- * Display metadata for Advanced tab sections. The category field must match a key in CONFIG_METADATA. Entries are sorted alphabetically by category.
+/* Display metadata for Advanced tab sections. The category field must match a key in CONFIG_METADATA. Entries are sorted alphabetically by category.
  */
 const ADVANCED_SECTION_META: { category: string; displayName: string }[] = [
 
   { category: "hls", displayName: "HLS" },
   { category: "logging", displayName: "Logging" },
+  { category: "paths", displayName: "Paths" },
   { category: "playback", displayName: "Playback" },
   { category: "recovery", displayName: "Recovery" },
   { category: "streaming", displayName: "Streaming" }
@@ -1216,9 +1249,7 @@ export function getSettingsTabSections(): SettingsSection[] {
 
     displayName: section.displayName,
     id: section.id,
-    settings: section.paths
-      .map((p) => getSettingByPath(p))
-      .filter((s): s is SettingMetadata => s !== undefined)
+    settings: section.paths.map((p) => getSettingByPath(p)).filter((s): s is SettingMetadata => s !== undefined)
   }));
 }
 
@@ -1232,15 +1263,11 @@ export function getUITabs(): UITab[] {
   const settingsTabPaths = SETTINGS_TAB_SECTIONS.flatMap((s) => s.paths);
 
   // Build Settings tab from sections.
-  const settingsTabSettings = settingsTabPaths
-    .map((p) => getSettingByPath(p))
-    .filter((s): s is SettingMetadata => s !== undefined);
+  const settingsTabSettings = settingsTabPaths.map((p) => getSettingByPath(p)).filter((s): s is SettingMetadata => s !== undefined);
 
   // Build Advanced tab from everything not in Settings.
   const advancedPaths = getAllSettingPaths().filter((p) => !settingsTabPaths.includes(p));
-  const advancedSettings = advancedPaths
-    .map((p) => getSettingByPath(p))
-    .filter((s): s is SettingMetadata => s !== undefined);
+  const advancedSettings = advancedPaths.map((p) => getSettingByPath(p)).filter((s): s is SettingMetadata => s !== undefined);
 
   return [
     {
@@ -1302,10 +1329,7 @@ export function getAdvancedSections(): AdvancedSection[] {
     }));
 }
 
-/*
- * DEFAULT VALUE FILTERING
- *
- * When saving user configuration, we only want to persist values that differ from defaults. This keeps the config file clean and makes it easy to see what the user has
+/* When saving user configuration, we only want to persist values that differ from defaults. This keeps the config file clean and makes it easy to see what the user has
  * actually customized. It also ensures that when defaults change in a new version, users automatically get the new defaults for settings they haven't explicitly set.
  */
 
@@ -1362,8 +1386,8 @@ export function isEqualToDefault(value: unknown, defaultValue: unknown): boolean
     return false;
   }
 
-  // Compare as strings for consistent comparison across types (handles number/string coercion).
-  return String(value) === String(defaultValue);
+  // Compare as strings for consistent comparison across types (handles number/string coercion). Config values are always primitives.
+  return String(value as string | number | boolean) === String(defaultValue as string | number | boolean);
 }
 
 /**
@@ -1399,8 +1423,8 @@ export function filterDefaults(config: UserConfig): UserConfig {
     }
   }
 
-  /* NON-CONFIG_METADATA FIELDS — Counterpart to the same section in mergeConfiguration() above. When adding a new non-CONFIG_METADATA field to
-   * mergeConfiguration(), you MUST also add corresponding preservation logic here, otherwise the field will be lost when saving configuration.
+  /* Counterpart to the non-CONFIG_METADATA handling in mergeConfiguration() above. When adding a new complex field there, you must also add preservation logic
+   * here AND in the POST /config handler in routes/config.ts, otherwise the field will be lost when saving configuration.
    */
   const configChannelsDisabled = getNestedValue(config, "channels.disabledPredefined") as string[] | undefined;
 
@@ -1409,11 +1433,25 @@ export function filterDefaults(config: UserConfig): UserConfig {
     setNestedValue(filtered, "channels.disabledPredefined", configChannelsDisabled);
   }
 
+  const configEnabledProviders = getNestedValue(config, "channels.enabledProviders") as string[] | undefined;
+
+  if(Array.isArray(configEnabledProviders) && (configEnabledProviders.length > 0)) {
+
+    setNestedValue(filtered, "channels.enabledProviders", configEnabledProviders);
+  }
+
   const configDeviceId = getNestedValue(config, "hdhr.deviceId") as string | undefined;
 
   if((typeof configDeviceId === "string") && (configDeviceId.length > 0)) {
 
     setNestedValue(filtered, "hdhr.deviceId", configDeviceId);
+  }
+
+  const configDebugFilter = getNestedValue(config, "logging.debugFilter") as string | undefined;
+
+  if((typeof configDebugFilter === "string") && (configDebugFilter.length > 0)) {
+
+    setNestedValue(filtered, "logging.debugFilter", configDebugFilter);
   }
 
   // Remove any empty nested objects that resulted from filtering.

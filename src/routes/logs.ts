@@ -4,22 +4,20 @@
  */
 import type { Express, Request, Response } from "express";
 import { isConsoleLogging, subscribeToLogs } from "../utils/index.js";
+import { CONFIG } from "../config/index.js";
 import type { Nullable } from "../types/index.js";
 import fs from "fs";
-import os from "os";
-import path from "path";
+import { getLogFilePath } from "../config/paths.js";
 
 const { promises: fsPromises } = fs;
 
-/*
- * LOG ENTRY TYPES
- *
- * Log entries are parsed from the log file format: [YYYY/MM/DD HH:MM:ss.l] [LEVEL] message
+/* Log entries are parsed from the log file format: [YYYY/MM/DD HH:MM:ss.l] [LEVEL] message
  * The level prefix is present for debug, warn, and error entries; info entries have no prefix.
  */
 
 interface LogEntry {
 
+  categoryTag?: string;
   level: "debug" | "error" | "info" | "warn";
   message: string;
   timestamp: string;
@@ -33,10 +31,7 @@ interface LogsResponse {
   total: number;
 }
 
-/*
- * LOG FILE PARSING
- *
- * The log file uses a consistent format that can be parsed with a regular expression. Each line starts with a bracketed timestamp, optionally followed by a bracketed
+/* The log file uses a consistent format that can be parsed with a regular expression. Each line starts with a bracketed timestamp, optionally followed by a bracketed
  * level indicator, then the message content. Log files may contain ANSI color codes for terminal viewing, which are stripped before parsing.
  */
 
@@ -44,8 +39,9 @@ interface LogsResponse {
 // eslint-disable-next-line no-control-regex
 const ANSI_PATTERN = /\x1b\[[0-9;]*m/g;
 
-// Pattern to match log entries: [timestamp] optional [LEVEL] message
-const LOG_LINE_PATTERN = /^\[(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\] (?:\[(WARN|ERROR|DEBUG)\] )?(.*)$/;
+// Pattern to match log entries: [timestamp] optional [LEVEL] or [LEVEL:category] message. The category suffix handles the new DEBUG:category format while
+// remaining backward-compatible with plain [DEBUG] entries from older log files.
+const LOG_LINE_PATTERN = /^\[(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\] (?:\[(WARN|ERROR|DEBUG(?::[^\]]+)?)\] )?(.*)$/;
 
 /**
  * Strips ANSI escape codes from a string. Used to clean log file lines that may contain terminal color codes.
@@ -66,20 +62,30 @@ function parseLogLine(line: string): Nullable<LogEntry> {
 
   // Strip ANSI color codes before parsing.
   const cleanLine = stripAnsiCodes(line);
-  const match = cleanLine.match(LOG_LINE_PATTERN);
+  const match = LOG_LINE_PATTERN.exec(cleanLine);
 
   if(!match) {
 
     return null;
   }
 
-  const [ , timestamp, levelStr, message ] = match;
+  const [ , timestamp, levelStr, message ] = match as unknown as [string, string, string | undefined, string];
 
   let level: "debug" | "error" | "info" | "warn" = "info";
+  let categoryTag: string | undefined;
 
-  if(levelStr === "DEBUG") {
+  if(levelStr?.startsWith("DEBUG")) {
 
     level = "debug";
+
+    // Extract the category suffix from "DEBUG:tuning:hulu" → "tuning:hulu". This preserves category information for web UI rendering so file-loaded entries
+    // display the same [DEBUG:category] badge as live SSE entries.
+    const colonIndex = levelStr.indexOf(":");
+
+    if(colonIndex !== -1) {
+
+      categoryTag = levelStr.substring(colonIndex + 1);
+    }
   } else if(levelStr === "WARN") {
 
     level = "warn";
@@ -88,7 +94,14 @@ function parseLogLine(line: string): Nullable<LogEntry> {
     level = "error";
   }
 
-  return { level, message, timestamp };
+  const entry: LogEntry = { level, message, timestamp };
+
+  if(categoryTag) {
+
+    entry.categoryTag = categoryTag;
+  }
+
+  return entry;
 }
 
 /**
@@ -105,7 +118,7 @@ async function readLogEntries(lines: number, levelFilter?: string): Promise<Logs
     return { entries: [], filtered: 0, mode: "console", total: 0 };
   }
 
-  const logFilePath = path.join(os.homedir(), ".prismcast", "prismcast.log");
+  const logFilePath = getLogFilePath(CONFIG);
 
   try {
 
@@ -153,10 +166,7 @@ async function readLogEntries(lines: number, levelFilter?: string): Promise<Logs
   }
 }
 
-/*
- * LOGS ENDPOINT
- *
- * The /logs endpoint provides access to recent application log entries. It supports query parameters for filtering and limiting results, and returns JSON data
+/* The /logs endpoint provides access to recent application log entries. It supports query parameters for filtering and limiting results, and returns JSON data
  * suitable for both API consumption and the landing page log viewer.
  */
 
@@ -191,10 +201,7 @@ export function setupLogsEndpoint(app: Express): void {
     }
   });
 
-  /*
-   * SSE LOG STREAM ENDPOINT
-   *
-   * The /logs/stream endpoint provides real-time log entries via Server-Sent Events. Connected clients receive log entries as they are written, eliminating the need
+  /* The /logs/stream endpoint provides real-time log entries via Server-Sent Events. Connected clients receive log entries as they are written, eliminating the need
    * for polling. The connection remains open until the client disconnects.
    */
 
@@ -229,10 +236,10 @@ export function setupLogsEndpoint(app: Express): void {
       res.write("data: " + eventData + "\n\n");
     });
 
-    // Send a heartbeat comment every 30 seconds to keep the connection alive through proxies.
+    // Send a named heartbeat event every 30 seconds to keep the connection alive through proxies and allow clients to detect staleness.
     const heartbeatInterval = setInterval(() => {
 
-      res.write(": heartbeat\n\n");
+      res.write("event: heartbeat\ndata: \n\n");
     }, 30000);
 
     // Clean up when the client disconnects.

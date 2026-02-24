@@ -4,24 +4,19 @@
  */
 import { EventEmitter } from "events";
 
-/*
- * LOG ENTRY TYPE
- *
- * Represents a structured log entry that can be serialized and sent to SSE clients. This type mirrors the LogEntry interface in logs.ts but is defined here to avoid
+/* Represents a structured log entry that can be serialized and sent to SSE clients. This type mirrors the LogEntry interface in logs.ts but is defined here to avoid
  * circular dependencies.
  */
 
 export interface LogEntry {
 
+  categoryTag?: string;
   level: "debug" | "error" | "info" | "warn";
   message: string;
   timestamp: string;
 }
 
-/*
- * LOG EVENT EMITTER
- *
- * A singleton EventEmitter that broadcasts log entries to all subscribed SSE clients. When a log entry is written via LOG.info/warn/error, the entry is emitted here
+/* A singleton EventEmitter that broadcasts log entries to all subscribed SSE clients. When a log entry is written via LOG.info/warn/error, the entry is emitted here
  * for real-time streaming to connected browsers.
  */
 

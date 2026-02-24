@@ -1,4 +1,5 @@
-# docker buildx build --platform linux/amd64 -f Dockerfile -t bnhf/prismcast:latest -t bnhf/prismcast:2026.01.29 . --push --no-cache
+# PrismCast Docker image. Published to ghcr.io/hjdhjd/prismcast on each release.
+# docker pull ghcr.io/hjdhjd/prismcast:latest
 FROM node:22-slim
 
 # Prevent interactive prompts during package installation.
@@ -96,7 +97,12 @@ RUN mkdir -p /root/.vnc
 # Set environment variables for the virtual display, Chrome binary, and Puppeteer.
 ENV DISPLAY=:99
 ENV CHROME_BIN=/usr/local/bin/chrome-no-sandbox
+ENV PRISMCAST_CONTAINER=1
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+
+# Data persistence. Mount a volume at the data directory to preserve configuration, Chrome profile, and logs across container recreations:
+#   docker run -v prismcast-data:/root/.prismcast ...
+# Custom directories are supported via PRISMCAST_DATA_DIR, PRISMCAST_CHROME_DATA_DIR, and PRISMCAST_LOG_FILE environment variables.
 
 # Expose all ports the container listens on.
 # 5589 - PrismCast web UI and streaming.

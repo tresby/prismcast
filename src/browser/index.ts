@@ -3,8 +3,9 @@
  * index.ts: Browser lifecycle management for PrismCast.
  */
 import type { Browser, LaunchOptions, Page } from "puppeteer-core";
-import { LOG, evaluateWithAbort, formatError } from "../utils/index.js";
+import { LOG, evaluateWithAbort, formatError, startTimer } from "../utils/index.js";
 import { getAllStreams, getStreamCount } from "../streaming/registry.js";
+import { getChromeDataDir, getDataDir, getExtensionDir } from "../config/paths.js";
 import { getEffectivePreset, getPresetViewport } from "../config/presets.js";
 import { getExtensionPage, getStream, launch } from "puppeteer-stream";
 import { resizeAndMinimizeWindow, unminimizeWindow } from "./cdp.js";
@@ -12,26 +13,23 @@ import { setBrowserChrome, setMaxSupportedViewport } from "./display.js";
 import { CONFIG } from "../config/index.js";
 import type { Nullable } from "../types/index.js";
 import type { SystemStatus } from "../streaming/statusEmitter.js";
+import { clearChannelSelectionCaches } from "./channelSelection.js";
 import { emitSystemStatusChanged } from "../streaming/statusEmitter.js";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { launch as puppeteerLaunch } from "puppeteer-core";
 import { terminateStream } from "../streaming/lifecycle.js";
 
 const { promises: fsPromises } = fs;
 
-/*
- * APPLICATION STATE
- *
- * Global variables maintain the application's runtime state across all operations. We minimize global state where possible, but some values must be shared across
+/* Global variables maintain the application's runtime state across all operations. We minimize global state where possible, but some values must be shared across
  * the application lifecycle:
  *
  * - currentBrowser: The shared browser instance. All streaming sessions use a single Chrome process to avoid the overhead of launching multiple browsers. This is
  *   created on first stream request (or during warmup) and persists until the application shuts down or the browser crashes.
  *
- * - dataDir: The filesystem location for persistent data (Chrome profile, extension files). This is always ~/.prismcast, which is created on startup if it doesn't
+ * - dataDir: The filesystem location for persistent data (Chrome profile, extension files). Resolved via config/paths.ts, which is created on startup if it doesn't
  *   exist.
  *
  * Stream tracking and ID generation have been moved to streaming/registry.ts for unified stream management across all output types (direct WebM, HLS, etc.).
@@ -45,13 +43,40 @@ let currentBrowser: Nullable<Browser> = null;
 // health endpoint to report the active Chrome version.
 let currentChromeVersion: Nullable<string> = null;
 
-// The data directory stores Chrome's profile data and the streaming extension files. This is always ~/.prismcast, which provides a consistent location for
-// user-specific data regardless of how PrismCast is run.
-const dataDir = path.join(os.homedir(), ".prismcast");
+// Timestamp (Date.now()) when the current browser instance was launched. Used by the opportunistic restart check to determine browser age. Cleared when the
+// browser disconnects.
+let browserLaunchTime: Nullable<number> = null;
+
+// Launch mutex. When a browser launch is in progress, this holds the pending promise so that concurrent callers piggyback on the same launch instead of
+// starting a second Chrome process. Cleared in a finally block once the launch settles.
+let browserLaunchPromise: Nullable<Promise<Browser>> = null;
+
+// The data directory stores Chrome's profile data and the streaming extension files. Path resolution is centralized in config/paths.ts.
 
 // The stale page cleanup interval handle, stored so we can clear it during graceful shutdown. The interval periodically checks for browser pages that are not
 // associated with active streams and closes them to prevent resource exhaustion.
 let stalePageCleanupInterval: Nullable<ReturnType<typeof setInterval>> = null;
+
+/* Opportunistic browser restart state. Chrome accumulates memory pressure, GPU process issues, and general flakiness over multi-hour sessions with continuous
+ * media playback. We proactively restart Chrome after it has been running for BROWSER_MAX_AGE, waiting for a quiet period with zero active streams before
+ * executing the restart. After the restart, a fresh browser is launched immediately so it is ready for the next stream request.
+ */
+
+// Maximum browser uptime before considering a restart (6 hours).
+const BROWSER_MAX_AGE = 6 * 60 * 60 * 1000;
+
+// Duration of the quiet period (zero streams) required before executing the restart (5 minutes).
+const BROWSER_RESTART_QUIET_PERIOD = 5 * 60 * 1000;
+
+// How often to check whether the browser qualifies for a restart (30 seconds).
+const BROWSER_RESTART_CHECK_INTERVAL = 30_000;
+
+// Timer handle for the quiet period countdown. When set, the browser has exceeded BROWSER_MAX_AGE and we are waiting for BROWSER_RESTART_QUIET_PERIOD to
+// elapse with zero active streams. Cancelled if a stream starts during the quiet period.
+let restartQuietTimer: Nullable<ReturnType<typeof setTimeout>> = null;
+
+// Interval handle for the periodic restart eligibility check.
+let restartCheckInterval: Nullable<ReturnType<typeof setInterval>> = null;
 
 // Flag indicating that the browser is being closed intentionally via closeBrowser(). When true, the disconnect handler skips error logging and stream termination
 // since these are handled by the shutdown code path. This prevents false "unexpected disconnect" errors during graceful shutdown.
@@ -73,10 +98,7 @@ export function setGracefulShutdown(value: boolean): void {
   gracefulShutdownInProgress = value;
 }
 
-/*
- * MANAGED PAGE TRACKING
- *
- * We track pages that PrismCast creates to distinguish them from pages that might be opened by other means (manually by the user, by site popups, etc.). Only pages we
+/* We track pages that PrismCast creates to distinguish them from pages that might be opened by other means (manually by the user, by site popups, etc.). Only pages we
  * create should be subject to stale page cleanup. This prevents the cleanup from interfering with pages the user opened for debugging or pages created by
  * streaming sites for authentication flows.
  *
@@ -98,10 +120,7 @@ const managedPageIds = new Set<string>();
 // the configured grace period before being closed. This prevents race conditions where pages are briefly untracked during initialization or cleanup transitions.
 const potentiallyStalePages = new Map<string, number>();
 
-/*
- * LOGIN MODE STATE
- *
- * Login mode allows users to authenticate with TV providers directly from the PrismCast web UI. When login mode is active:
+/* Login mode allows users to authenticate with TV providers directly from the PrismCast web UI. When login mode is active:
  *
  * - A dedicated login tab is open in the browser showing the channel's URL
  * - The browser window is un-minimized so the user can interact with it
@@ -153,7 +172,7 @@ export async function emitCurrentSystemStatus(): Promise<void> {
 
   try {
 
-    if(currentBrowser && currentBrowser.isConnected()) {
+    if(currentBrowser?.connected) {
 
       const pages = await currentBrowser.pages();
 
@@ -170,7 +189,7 @@ export async function emitCurrentSystemStatus(): Promise<void> {
 
     browser: {
 
-      connected: !!currentBrowser && currentBrowser.isConnected(),
+      connected: !!currentBrowser && currentBrowser.connected,
       pageCount
     },
     memory: {
@@ -240,19 +259,10 @@ function getManagedPageId(page: Page): string | undefined {
 }
 
 /**
- * Gets the current data directory path. This is where Chrome profile data and extension files are stored.
- * @returns The data directory path.
- */
-export function getDataDir(): string {
-
-  return dataDir;
-}
-
-/**
  * Ensures the data directory exists, creating it if necessary. This should be called during application startup before any operations that depend on the data
  * directory (like browser launch or extension preparation).
  *
- * The data directory (~/.prismcast) stores:
+ * The data directory stores:
  * - Chrome profile data (cookies, local storage, session state)
  * - Extension files (when running as a packaged executable)
  */
@@ -260,21 +270,18 @@ export async function ensureDataDirectory(): Promise<void> {
 
   try {
 
-    await fsPromises.mkdir(dataDir, { recursive: true });
+    await fsPromises.mkdir(getDataDir(), { recursive: true });
 
-    LOG.info("Data directory ready: %s.", dataDir);
+    LOG.debug("browser", "Data directory ready: %s.", getDataDir());
   } catch(error) {
 
-    LOG.error("Failed to create data directory %s: %s.", dataDir, formatError(error));
+    LOG.error("Failed to create data directory %s: %s.", getDataDir(), formatError(error));
 
     throw error;
   }
 }
 
-/*
- * BROWSER MANAGEMENT
- *
- * These functions handle the Chrome browser lifecycle: startup, cleanup, and instance management. The browser is a shared resource used by all streaming sessions,
+/* These functions handle the Chrome browser lifecycle: startup, cleanup, and instance management. The browser is a shared resource used by all streaming sessions,
  * so careful lifecycle management is essential for reliability. Key considerations:
  *
  * - Single browser instance: We use one Chrome process for all streams to minimize resource overhead. Each stream gets its own tab (page) within that browser.
@@ -290,29 +297,130 @@ export async function ensureDataDirectory(): Promise<void> {
  */
 
 /**
- * Terminates any Chrome processes that are still using our profile directory from previous runs. Chrome locks its profile directory while running, and if a
- * previous instance crashed without releasing the lock, we cannot launch a new browser with the same profile. This function uses pkill to find and terminate any
- * Chrome processes whose command line contains our profile directory path.
+ * Ensures a clean slate for browser launch by terminating any stale Chrome processes and removing orphaned profile lock files. Chrome locks its profile directory
+ * while running, and if a previous instance crashed without releasing the lock, we cannot launch a new browser with the same profile. This function uses pkill to
+ * find and terminate any Chrome processes whose command line contains our profile directory path, then polls pgrep to verify the processes have actually exited.
+ * After process cleanup, it removes stale lock files (SingletonLock, SingletonCookie, SingletonSocket) and DevToolsActivePort from the profile directory.
  *
- * This is called at startup before launching the browser to ensure a clean slate. It's safe to call even when no stale processes exist - pkill returns a non-zero
- * exit code when no processes match, which we ignore.
+ * The termination strategy escalates from SIGTERM to SIGKILL. SIGTERM is sent first, giving Chrome up to 5 seconds to flush its profile databases (LevelDB,
+ * extension state, session storage) and exit cleanly. If Chrome does not exit, SIGKILL is sent as a fallback. This escalation is critical when called from the
+ * process exit handler — Chrome may be running normally (e.g., after a capture probe timeout), and an immediate SIGKILL would corrupt its profile databases,
+ * poisoning the Docker volume for subsequent container restarts.
+ *
+ * The file cleanup is essential for Docker deployments. Container restarts destroy Chrome processes without giving them a chance to release profile locks, but the
+ * lock files persist in the mounted volume. Without removing them, Chrome cannot start in the new container, causing a crash loop.
+ *
+ * This is called at startup before launching the browser and after closeBrowser() during shutdown. It's safe to call even when no stale processes or files exist.
  */
 export function killStaleChrome(): void {
 
   // Build the profile directory path that would appear in Chrome's command-line arguments.
-  const profileDir = path.join(dataDir, CONFIG.paths.chromeProfileName);
+  const profileDir = getChromeDataDir(CONFIG);
+  const POLL_INTERVAL_MS = 200;
 
   try {
 
-    // Use pkill with -f to match against the full command line, not just the process name. This finds Chrome processes that were launched with our profile
-    // directory. The command is wrapped in quotes to handle paths with spaces.
+    // Send SIGTERM first to give Chrome a chance to flush its profile databases (LevelDB, extension state, session storage) before exiting. This is critical
+    // when called from the process exit handler — Chrome may be running normally (e.g., after a capture probe timeout) and SIGKILL would corrupt its profile
+    // databases, poisoning the Docker volume for subsequent restarts.
     execSync([ "pkill -f \"", profileDir, "\"" ].join(""));
 
-    LOG.info("Killed stale Chromium instances using %s.", profileDir);
+    LOG.debug("browser", "Sent SIGTERM to Chrome instances using %s.", profileDir);
+
+    // Wait up to 5 seconds for Chrome to flush its databases and exit after SIGTERM. Containerized environments with software rendering and shared CPU may
+    // need the full window.
+    const TERM_WAIT_MS = 5000;
+
+    if(!waitForChromeExit(profileDir, TERM_WAIT_MS, POLL_INTERVAL_MS)) {
+
+      // SIGTERM didn't work. Escalate to SIGKILL. Orphaned Chrome processes (from a crashed parent or previous container) may not respond to SIGTERM.
+      LOG.debug("browser", "Chrome did not exit after SIGTERM. Escalating to SIGKILL.");
+
+      try {
+
+        execSync([ "pkill -9 -f \"", profileDir, "\"" ].join(""));
+      } catch(_error) {
+
+        // No matching processes — Chrome may have exited between the pgrep check and the pkill.
+      }
+
+      const KILL_WAIT_MS = 2000;
+
+      if(!waitForChromeExit(profileDir, KILL_WAIT_MS, POLL_INTERVAL_MS)) {
+
+        LOG.warn("Chrome processes did not exit after %sms of signal escalation. Proceeding anyway.", TERM_WAIT_MS + KILL_WAIT_MS);
+      }
+    }
   } catch(_error) {
 
-    // When pkill finds no matching processes, it returns a non-zero exit code. This is expected when there are no stale processes from a clean shutdown. We
-    // silently ignore this expected case.
+    // When pkill finds no matching processes, it returns a non-zero exit code. This is expected when there are no stale processes from a clean shutdown.
+  }
+
+  // Remove stale lock and port files left behind by an unclean Chrome exit.
+  cleanStaleProfileFiles(profileDir);
+}
+
+/**
+ * Polls pgrep until no Chrome processes matching the profile directory remain, or the timeout expires. pgrep returns exit code 0 when matching processes exist
+ * and non-zero when none remain.
+ * @param profileDir - The Chrome profile directory path to match against process command lines.
+ * @param timeoutMs - Maximum time to wait in milliseconds.
+ * @param pollIntervalMs - Time between pgrep checks in milliseconds.
+ * @returns True if all matching processes exited within the timeout, false otherwise.
+ */
+function waitForChromeExit(profileDir: string, timeoutMs: number, pollIntervalMs: number): boolean {
+
+  const deadline = Date.now() + timeoutMs;
+
+  while(Date.now() < deadline) {
+
+    try {
+
+      execSync([ "pgrep -f \"", profileDir, "\"" ].join(""), { stdio: "ignore" });
+
+      // Processes still exist. Wait and check again.
+      execSync([ "sleep ", String(pollIntervalMs / 1000) ].join(""));
+    } catch(_error) {
+
+      // pgrep returned non-zero — no matching processes remain.
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Removes stale Chrome profile lock files and the DevTools port file. Chrome writes these while running and removes them on clean shutdown, but an unclean exit
+ * (container kill, SIGKILL, crash) leaves them behind. Stale lock files prevent Chrome from acquiring the profile, and a stale DevToolsActivePort can confuse the
+ * Puppeteer connection.
+ * @param profileDir - The Chrome user data directory path.
+ */
+function cleanStaleProfileFiles(profileDir: string): void {
+
+  // Chrome's profile lock mechanism uses three symlinks: SingletonLock (hostname-PID pair), SingletonCookie (numeric verification token), and SingletonSocket
+  // (path to the IPC socket). All three must be removed for Chrome to acquire a fresh lock. DevToolsActivePort contains the debugging port from the previous
+  // session and is irrelevant when launching a new browser instance.
+  const staleFiles = [ "DevToolsActivePort", "SingletonCookie", "SingletonLock", "SingletonSocket" ];
+
+  for(const file of staleFiles) {
+
+    const filePath = path.join(profileDir, file);
+
+    try {
+
+      fs.unlinkSync(filePath);
+
+      LOG.debug("browser", "Removed stale profile file: %s.", file);
+    } catch(error: unknown) {
+
+      // ENOENT means the file doesn't exist, which is the expected case after a clean shutdown. Any other error (permissions, filesystem issues) is worth
+      // logging as a warning since it could prevent Chrome from starting.
+      if((error as NodeJS.ErrnoException).code !== "ENOENT") {
+
+        LOG.warn("Failed to remove stale profile file %s: %s.", file, formatError(error));
+      }
+    }
   }
 }
 
@@ -370,8 +478,7 @@ export function buildLaunchOptions(): LaunchOptions {
 
   return {
 
-    /*
-     * Chrome command-line arguments. Each flag serves a specific purpose for reliable streaming:
+    /* Chrome command-line arguments. Each flag serves a specific purpose for reliable streaming:
      *
      * --allow-running-insecure-content: Some streaming sites serve mixed HTTP/HTTPS content. Without this flag, the browser blocks HTTP resources on HTTPS
      *   pages, which can break video players that load some assets over HTTP.
@@ -432,8 +539,7 @@ export function buildLaunchOptions(): LaunchOptions {
     // the window after launch to reduce GPU usage while still allowing capture.
     headless: false,
 
-    /*
-     * Prevent Puppeteer from adding certain default arguments that would interfere with streaming:
+    /* Prevent Puppeteer from adding certain default arguments that would interfere with streaming:
      *
      * --disable-component-extensions-with-background-pages: We need extension background pages for puppeteer-stream to function.
      *
@@ -467,7 +573,7 @@ export function buildLaunchOptions(): LaunchOptions {
 
     // Persistent user data directory for Chrome profile. This directory stores cookies, local storage, and other session data. By persisting this across
     // restarts, sites remember login state and don't require re-authentication.
-    userDataDir: path.join(dataDir, CONFIG.paths.chromeProfileName)
+    userDataDir: getChromeDataDir(CONFIG)
   };
 }
 
@@ -484,19 +590,12 @@ async function launchWithCustomArgs(opts: LaunchOptions): Promise<Browser> {
   // them with paths to our extracted extension files.
   if(process.pkg) {
 
-    const extensionPath = path.join(dataDir, CONFIG.paths.extensionDirName);
+    const extensionPath = getExtensionDir(CONFIG);
 
     // Remove any existing extension arguments and add our own pointing to the extracted extension.
     opts.args = (opts.args ?? [])
-      .filter((arg: string): boolean => {
-
-        return !arg.startsWith("--load-extension=") && !arg.startsWith("--disable-extensions-except=");
-      })
-      .concat([
-
-        [ "--disable-extensions-except=", extensionPath ].join(""),
-        [ "--load-extension=", extensionPath ].join("")
-      ]);
+      .filter((arg: string): boolean => !arg.startsWith("--load-extension=") && !arg.startsWith("--disable-extensions-except="))
+      .concat([ "--disable-extensions-except=" + extensionPath, "--load-extension=" + extensionPath ]);
   }
 
   return puppeteerLaunch(opts);
@@ -551,7 +650,7 @@ async function detectDisplayDimensions(browser: Browser): Promise<void> {
     setBrowserChrome(dimensions.chromeWidth, dimensions.chromeHeight);
     setMaxSupportedViewport(maxWidth, maxHeight);
 
-    LOG.debug("Display detection complete: screen %s\u00d7%s, chrome %s\u00d7%s, max viewport %s\u00d7%s.",
+    LOG.debug("browser", "Display detection complete: screen %s\u00d7%s, chrome %s\u00d7%s, max viewport %s\u00d7%s.",
       dimensions.availWidth, dimensions.availHeight,
       dimensions.chromeWidth, dimensions.chromeHeight,
       maxWidth, maxHeight);
@@ -598,9 +697,20 @@ async function detectDisplayDimensions(browser: Browser): Promise<void> {
  */
 function handleBrowserDisconnect(): void {
 
-  // Clear the browser reference and cached version so getCurrentBrowser() will launch a new instance on the next call.
+  // Clear the browser reference, launch timestamp, and cached version so getCurrentBrowser() will launch a new instance on the next call.
   currentBrowser = null;
+  browserLaunchTime = null;
   currentChromeVersion = null;
+
+  // Cancel any pending restart quiet timer since the browser is already gone.
+  if(restartQuietTimer) {
+
+    clearTimeout(restartQuietTimer);
+    restartQuietTimer = null;
+  }
+
+  // Clear all channel selection caches. Cached state (guide row positions, discovered page URLs) may be stale in a new browser session.
+  clearChannelSelectionCaches();
 
   // Clear login state if login mode was active. We clear directly rather than calling endLoginMode() because the browser is already gone and we don't want to
   // attempt any browser operations.
@@ -650,22 +760,51 @@ function handleBrowserDisconnect(): void {
  *
  * - Returning the existing browser if it's still connected
  * - Launching a new browser if none exists or the previous one disconnected
+ * - Serializing concurrent callers so only one launch occurs at a time
  * - Waiting for the puppeteer-stream extension to initialize
- * - Minimizing the browser window to reduce GPU usage
  * - Setting up disconnect handlers for crash recovery
  * @returns The browser instance.
  * @throws If the browser cannot be launched.
  */
 export async function getCurrentBrowser(): Promise<Browser> {
 
-  // Fast path: if we have a browser and it's still connected, return it immediately. The isConnected() check verifies the DevTools Protocol connection is
+  // Fast path: if we have a browser and it's still connected, return it immediately. The connected property verifies the DevTools Protocol connection is
   // still alive.
-  if(currentBrowser && currentBrowser.isConnected()) {
+  if(currentBrowser?.connected) {
 
     return currentBrowser;
   }
 
-  // We need to launch a new browser. This happens on first stream request, after a browser crash, or during server warmup.
+  // If a launch is already in progress (e.g., from the restart path or a concurrent stream request), piggyback on that promise instead of starting a second
+  // Chrome process. Two concurrent launches with the same profile directory would contend on Chrome's profile lock.
+  if(browserLaunchPromise) {
+
+    return browserLaunchPromise;
+  }
+
+  // We need to launch a new browser. Store the promise so concurrent callers can piggyback on this launch.
+  browserLaunchPromise = launchBrowser();
+
+  try {
+
+    return await browserLaunchPromise;
+  } finally {
+
+    browserLaunchPromise = null;
+  }
+}
+
+/**
+ * Launches a new browser instance and performs post-launch initialization (extension readiness, display detection, version capture). This is the inner launch
+ * function called by getCurrentBrowser() and serialized by the browserLaunchPromise mutex.
+ * @returns The browser instance.
+ * @throws If the browser cannot be launched.
+ */
+async function launchBrowser(): Promise<Browser> {
+
+  const browserElapsed = startTimer();
+
+  // This happens on first stream request, after a browser crash, during server warmup, or during an opportunistic restart.
   try {
 
     const options = buildLaunchOptions();
@@ -676,6 +815,8 @@ export async function getCurrentBrowser(): Promise<Browser> {
 
     // Register a handler for browser disconnection. This ensures we clean up properly if the browser crashes or is closed unexpectedly.
     currentBrowser.on("disconnected", handleBrowserDisconnect);
+
+    LOG.debug("timing:browser", "Chrome process spawned. (+%sms)", browserElapsed());
 
     // Poll for the puppeteer-stream extension to finish initializing. The extension injects a START_RECORDING function into its options page context. We poll
     // for this function's existence rather than using a fixed delay, so the browser is ready as soon as the extension loads — typically 200-500ms rather than the
@@ -692,21 +833,24 @@ export async function getCurrentBrowser(): Promise<Browser> {
       LOG.warn("Extension did not initialize within %d ms. Streams may need additional time to start.", CONFIG.browser.initTimeout);
     }
 
+    LOG.debug("timing:browser", "Extension initialized. (+%sms)", browserElapsed());
+
     // Detect display dimensions to determine maximum supported viewport. This must happen before we start streaming so the preset system can degrade to a
     // smaller preset if needed.
     await detectDisplayDimensions(currentBrowser);
 
-    // Minimize the browser window to reduce GPU usage and desktop clutter. The browser must be visible (not headless) for capture to work, but minimizing
-    // it reduces resource consumption. CDP allows us to control window state without affecting capture.
-    await minimizeBrowserWindow();
+    LOG.debug("timing:browser", "Display detection complete. (+%sms)", browserElapsed());
 
     // Log the Chrome version for diagnostic reference. This helps correlate browser behavior changes (tab unresponsiveness, memory pressure, capture issues)
     // with specific Chrome releases.
     const chromeVersion = await currentBrowser.version();
 
+    browserLaunchTime = Date.now();
     currentChromeVersion = chromeVersion;
 
     LOG.info("Chrome ready: %s.", chromeVersion);
+
+    LOG.debug("timing:browser", "Browser ready. Total: %sms.", browserElapsed());
 
     // Emit system status update for SSE subscribers.
     await emitCurrentSystemStatus();
@@ -714,8 +858,9 @@ export async function getCurrentBrowser(): Promise<Browser> {
 
     LOG.error("Failed to launch browser: %s.", formatError(error));
 
-    // Clear the browser reference and cached version on failure so the next call will attempt to launch again.
+    // Clear the browser reference, launch timestamp, and cached version on failure so the next call will attempt to launch again.
     currentBrowser = null;
+    browserLaunchTime = null;
     currentChromeVersion = null;
 
     throw error;
@@ -739,7 +884,7 @@ export function getChromeVersion(): Nullable<string> {
  */
 export function isBrowserConnected(): boolean {
 
-  return !!currentBrowser && currentBrowser.isConnected();
+  return !!currentBrowser && currentBrowser.connected;
 }
 
 /**
@@ -753,7 +898,7 @@ export function isBrowserConnected(): boolean {
 export async function minimizeBrowserWindow(): Promise<void> {
 
   // Guard against calling this when no browser is running.
-  if(!currentBrowser || !currentBrowser.isConnected()) {
+  if(!currentBrowser?.connected) {
 
     return;
   }
@@ -806,7 +951,7 @@ export async function minimizeBrowserWindow(): Promise<void> {
     }
 
     // Resizing/minimizing is not critical - log a warning but don't fail the operation.
-    LOG.warn("Could not resize and minimize browser window: %s.", formatError(error));
+    LOG.debug("browser", "Could not resize and minimize browser window: %s.", formatError(error));
   }
 }
 
@@ -817,7 +962,7 @@ export async function minimizeBrowserWindow(): Promise<void> {
 export async function getBrowserPages(): Promise<Page[]> {
 
   // Guard against calling this when no browser is running.
-  if(!currentBrowser || !currentBrowser.isConnected()) {
+  if(!currentBrowser?.connected) {
 
     return [];
   }
@@ -836,10 +981,9 @@ export async function getBrowserPages(): Promise<Page[]> {
  * Closes the browser and cleans up resources. This is called during graceful shutdown to ensure Chrome exits cleanly. After this call, the browser reference is
  * cleared and any subsequent stream requests will launch a fresh browser.
  *
- * The function uses a multi-stage approach to ensure Chrome actually exits:
- * 1. Try browser.close() with a 5-second timeout
- * 2. If that fails or times out, kill the browser process directly
- * 3. As a final fallback, use pkill to terminate any Chrome processes using our profile
+ * The function uses a two-stage approach to ensure Chrome actually exits:
+ * 1. Try browser.close() with a 5-second timeout (DevTools Protocol graceful close)
+ * 2. Run killStaleChrome() to catch anything Stage 1 missed, using SIGTERM→SIGKILL escalation to give Chrome a chance to flush its profile databases
  */
 export async function closeBrowser(): Promise<void> {
 
@@ -849,8 +993,9 @@ export async function closeBrowser(): Promise<void> {
 
   const browserRef = currentBrowser;
 
-  // Clear the reference and cached version early to prevent any new operations from using it.
+  // Clear the reference, launch timestamp, and cached version early to prevent any new operations from using it.
   currentBrowser = null;
+  browserLaunchTime = null;
   currentChromeVersion = null;
 
   if(!browserRef) {
@@ -859,18 +1004,14 @@ export async function closeBrowser(): Promise<void> {
   }
 
   // Stage 1: Try graceful close with a timeout. We use Promise.race to avoid hanging indefinitely if Chrome is unresponsive.
-  let closedGracefully = false;
-
-  if(browserRef.isConnected()) {
+  if(browserRef.connected) {
 
     try {
 
       await Promise.race([
         browserRef.close(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("Browser close timed out")), 5000))
+        new Promise((_, reject) => setTimeout(() => { reject(new Error("Browser close timed out")); }, 5000))
       ]);
-
-      closedGracefully = true;
     } catch(error) {
 
       const message = formatError(error);
@@ -880,40 +1021,17 @@ export async function closeBrowser(): Promise<void> {
         LOG.warn("Browser did not close within 5 seconds. Forcing termination.");
       } else {
 
-        LOG.debug("Browser close error: %s.", message);
+        LOG.debug("browser", "Browser close error: %s.", message);
       }
-    }
-  } else {
-
-    closedGracefully = true;
-  }
-
-  // Stage 2: If graceful close failed, try to kill the process directly.
-  if(!closedGracefully) {
-
-    try {
-
-      const browserProcess = browserRef.process();
-
-      if(browserProcess && !browserProcess.killed) {
-
-        browserProcess.kill("SIGKILL");
-        LOG.debug("Sent SIGKILL to browser process.");
-      }
-    } catch(error) {
-
-      LOG.debug("Browser process kill error: %s.", formatError(error));
     }
   }
 
-  // Stage 3: As a final fallback, use pkill to ensure no Chrome processes using our profile remain.
+  // Stage 2: Catch anything Stage 1 missed. If Chrome didn't respond to the DevTools close command (broken WebSocket, hung process), killStaleChrome()
+  // sends SIGTERM first to give Chrome a chance to flush its profile databases, then escalates to SIGKILL if needed.
   killStaleChrome();
 }
 
-/*
- * LOGIN MODE
- *
- * These functions manage the login mode workflow, allowing users to authenticate with TV providers through the browser. The workflow is:
+/* These functions manage the login mode workflow, allowing users to authenticate with TV providers through the browser. The workflow is:
  *
  * 1. User clicks "Login" on a channel in the web UI
  * 2. startLoginMode() opens a new tab with the channel's URL and un-minimizes the browser
@@ -941,7 +1059,7 @@ export async function startLoginMode(url: string): Promise<{ error?: string; suc
   }
 
   // Ensure browser is available.
-  if(!currentBrowser || !currentBrowser.isConnected()) {
+  if(!currentBrowser?.connected) {
 
     return { error: "Browser is not connected.", success: false };
   }
@@ -1046,7 +1164,7 @@ export async function endLoginMode(): Promise<void> {
   loginStartTime = null;
 
   // Re-minimize the browser window.
-  if(wasActive && currentBrowser && currentBrowser.isConnected()) {
+  if(wasActive && currentBrowser?.connected) {
 
     await minimizeBrowserWindow();
   }
@@ -1080,10 +1198,7 @@ export function getLoginStatus(): LoginStatus {
   };
 }
 
-/*
- * STALE PAGE CLEANUP
- *
- * Over time, browser pages (tabs) may accumulate if cleanup fails during stream termination. This can happen due to race conditions, errors during cleanup, or
+/* Over time, browser pages (tabs) may accumulate if cleanup fails during stream termination. This can happen due to race conditions, errors during cleanup, or
  * edge cases in stream lifecycle management. Each orphaned page consumes memory and may continue running JavaScript, so we periodically clean them up.
  *
  * The cleanup has several safeguards to prevent closing pages that shouldn't be closed:
@@ -1113,7 +1228,7 @@ export function getLoginStatus(): LoginStatus {
 export async function cleanupStalePages(): Promise<void> {
 
   // Guard against calling this when no browser is running.
-  if(!currentBrowser || !currentBrowser.isConnected()) {
+  if(!currentBrowser?.connected) {
 
     return;
   }
@@ -1149,7 +1264,7 @@ export async function cleanupStalePages(): Promise<void> {
     // - It has a managed page ID (was created by PrismCast)
     // - It is not associated with any active stream
     // - It has been stale for longer than the grace period
-    const candidatePages: Array<{ page: Page; pageId: string }> = [];
+    const candidatePages: { page: Page; pageId: string }[] = [];
 
     // Track which managed page IDs we've seen in the current browser pages. Used for cleanup of stale tracking data.
     const currentManagedIds = new Set<string>();
@@ -1235,12 +1350,12 @@ export async function cleanupStalePages(): Promise<void> {
     // Log only if we actually closed something, to avoid log spam from idle cleanup runs.
     if(closedCount > 0) {
 
-      LOG.info("Cleaned up %s stale page(s).", closedCount);
+      LOG.debug("browser", "Cleaned up %s stale page(s).", closedCount);
     }
   } catch(error) {
 
     // Cleanup failure is not critical - log a warning and try again next interval.
-    LOG.warn("Stale page cleanup failed: %s.", formatError(error));
+    LOG.debug("browser", "Stale page cleanup failed: %s.", formatError(error));
   }
 }
 
@@ -1250,7 +1365,7 @@ export async function cleanupStalePages(): Promise<void> {
  */
 export function startStalePageCleanup(): void {
 
-  stalePageCleanupInterval = setInterval(cleanupStalePages, CONFIG.recovery.stalePageCleanupInterval);
+  stalePageCleanupInterval = setInterval(() => { void cleanupStalePages(); }, CONFIG.recovery.stalePageCleanupInterval);
 }
 
 /**
@@ -1267,10 +1382,136 @@ export function stopStalePageCleanup(): void {
   }
 }
 
-/*
- * EXTENSION PREPARATION
- *
- * When running as a packaged executable (created by the `pkg` tool), the application is bundled into a single binary. Node modules like puppeteer-stream are
+/* Opportunistic browser restart functions. The check runs on a 30-second interval and, when the browser exceeds BROWSER_MAX_AGE with zero active streams, starts
+ * a quiet period timer. The quiet timer is cancelled if a stream starts, ensuring active viewers are never disrupted. When the timer expires, the browser is
+ * closed and immediately re-launched.
+ */
+
+/**
+ * Checks whether the browser qualifies for an opportunistic restart. Called periodically by the restart check interval. The check skips when any of these
+ * conditions hold: graceful shutdown in progress, login mode active, browser not connected, browser age below threshold. If active streams exist, any pending
+ * quiet timer is cancelled (streams started during the quiet period reset the countdown). Otherwise a quiet timer is started if one is not already running.
+ */
+function checkBrowserRestart(): void {
+
+  // Skip if the server is shutting down, login mode is active, or the browser is not connected.
+  if(gracefulShutdownInProgress || loginModeActive || !currentBrowser || !currentBrowser.connected || !browserLaunchTime) {
+
+    return;
+  }
+
+  // Skip if the browser has not exceeded the maximum age.
+  const age = Date.now() - browserLaunchTime;
+
+  if(age < BROWSER_MAX_AGE) {
+
+    return;
+  }
+
+  // If there are active streams, cancel any pending quiet timer and return. Streams that start during the quiet period reset the countdown.
+  if(getStreamCount() > 0) {
+
+    if(restartQuietTimer) {
+
+      LOG.debug("browser", "Browser restart quiet period cancelled — streams are active.");
+
+      clearTimeout(restartQuietTimer);
+      restartQuietTimer = null;
+    }
+
+    return;
+  }
+
+  // No active streams and the browser is old enough. Start the quiet timer if one is not already running.
+  if(!restartQuietTimer) {
+
+    LOG.debug("browser", "Browser uptime exceeds threshold. Quiet period started — restart will proceed if no streams start within %s minutes.",
+      Math.round(BROWSER_RESTART_QUIET_PERIOD / 60000));
+
+    restartQuietTimer = setTimeout(() => {
+
+      void executeBrowserRestart();
+    }, BROWSER_RESTART_QUIET_PERIOD);
+  }
+}
+
+/**
+ * Executes the opportunistic browser restart after the quiet period has elapsed. Performs a final guard check before proceeding, then closes the browser and
+ * immediately re-launches a fresh instance.
+ */
+async function executeBrowserRestart(): Promise<void> {
+
+  // Clear the timer handle.
+  restartQuietTimer = null;
+
+  // Final guard: re-check all preconditions. Conditions may have changed during the quiet period (e.g., a stream started just before the timer fired, login
+  // mode was activated, or the browser disconnected on its own).
+  if(gracefulShutdownInProgress || loginModeActive || (getStreamCount() > 0) || !currentBrowser || !currentBrowser.connected || !browserLaunchTime) {
+
+    LOG.debug("browser", "Browser restart aborted — preconditions no longer met.");
+
+    return;
+  }
+
+  const age = Date.now() - browserLaunchTime;
+  const hours = Math.floor(age / 3600000);
+  const minutes = Math.floor((age % 3600000) / 60000);
+
+  LOG.info("Restarting browser for scheduled maintenance (uptime: %sh %sm).", hours, minutes);
+
+  try {
+
+    // closeBrowser() sets gracefulShutdownInProgress = true internally and performs multi-stage graceful close.
+    await closeBrowser();
+
+    // Reset the flag since the server is NOT shutting down — only the browser is restarting.
+    setGracefulShutdown(false);
+
+    // Launch a fresh browser instance so it is ready for the next stream request.
+    await getCurrentBrowser();
+
+    // Minimize the new window to reduce GPU usage and desktop clutter.
+    await minimizeBrowserWindow();
+
+    LOG.info("Browser restart complete. Fresh instance is ready.");
+  } catch(error) {
+
+    LOG.error("Browser restart failed: %s.", formatError(error));
+
+    // Ensure the graceful shutdown flag is cleared even on failure so new stream requests can still launch a browser.
+    setGracefulShutdown(false);
+  }
+}
+
+/**
+ * Starts the periodic browser restart eligibility check. This should be called once during server startup, after the browser is initialized. The interval runs
+ * indefinitely until stopBrowserRestartChecking() is called (typically during graceful shutdown).
+ */
+export function startBrowserRestartChecking(): void {
+
+  restartCheckInterval = setInterval(checkBrowserRestart, BROWSER_RESTART_CHECK_INTERVAL);
+}
+
+/**
+ * Stops the browser restart checking interval and cancels any pending quiet timer. This should be called during graceful shutdown to prevent a restart from
+ * racing with server shutdown.
+ */
+export function stopBrowserRestartChecking(): void {
+
+  if(restartCheckInterval) {
+
+    clearInterval(restartCheckInterval);
+    restartCheckInterval = null;
+  }
+
+  if(restartQuietTimer) {
+
+    clearTimeout(restartQuietTimer);
+    restartQuietTimer = null;
+  }
+}
+
+/* When running as a packaged executable (created by the `pkg` tool), the application is bundled into a single binary. Node modules like puppeteer-stream are
  * included in the bundle, but Chrome cannot load extensions from within the packaged binary - it needs actual files on the filesystem.
  *
  * To solve this, we extract the puppeteer-stream extension files to the application's data directory during startup. This happens only when process.pkg is
@@ -1299,8 +1540,8 @@ export async function prepareExtension(): Promise<void> {
 
   try {
 
-    // The extension files are extracted to ~/.prismcast/extension (the data directory is ensured to exist before this function is called).
-    const out = path.join(dataDir, CONFIG.paths.extensionDirName);
+    // The extension files are extracted to the extension directory within the data directory (ensured to exist before this function is called).
+    const out = getExtensionDir(CONFIG);
 
     // Create the extension directory if it doesn't exist.
     try {
@@ -1335,7 +1576,7 @@ export async function prepareExtension(): Promise<void> {
       }
     }
 
-    LOG.info("Extension files prepared successfully.");
+    LOG.debug("browser", "Extension files prepared successfully.");
   } catch(error) {
 
     LOG.error("Extension preparation failed: %s.", formatError(error));

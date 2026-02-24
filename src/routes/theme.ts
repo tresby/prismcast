@@ -3,10 +3,7 @@
  * theme.ts: Centralized theme system with CSS custom properties for PrismCast UI.
  */
 
-/*
- * THEME SYSTEM
- *
- * This module provides a centralized color and styling system for all PrismCast web pages. It uses CSS custom properties (variables) to enable consistent theming
+/* This module provides a centralized color and styling system for all PrismCast web pages. It uses CSS custom properties (variables) to enable consistent theming
  * and automatic dark mode support via the prefers-color-scheme media query.
  *
  * Color tokens are organized semantically:
@@ -34,6 +31,7 @@ export function generateThemeStyles(): string {
     "  --surface-elevated: #f9f9f9;",
     "  --surface-sunken: #f4f4f4;",
     "  --surface-overlay: #ffffff;",
+    "  --surface-hover: #eeeeee;",
     "  --surface-code: #f4f4f4;",
     "  --surface-pre: #f8f8f8;",
 
@@ -41,7 +39,8 @@ export function generateThemeStyles(): string {
     "  --text-primary: #333333;",
     "  --text-secondary: #666666;",
     "  --text-muted: #888888;",
-    "  --text-disabled: #999999;",
+    "  --text-tertiary: #999999;",
+    "  --text-disabled: #aaaaaa;",
     "  --text-heading: #2c3e50;",
     "  --text-heading-secondary: #34495e;",
     "  --text-inverse: #ffffff;",
@@ -59,6 +58,8 @@ export function generateThemeStyles(): string {
     "  --interactive-secondary-hover: #7f8c8d;",
     "  --interactive-danger: #e74c3c;",
     "  --interactive-danger-hover: #c0392b;",
+    "  --interactive-success: #27ae60;",
+    "  --interactive-success-hover: #219a52;",
     "  --interactive-edit: #17a2b8;",
     "  --interactive-edit-hover: #138496;",
     "  --interactive-delete: #dc3545;",
@@ -74,6 +75,9 @@ export function generateThemeStyles(): string {
     "  --status-error-bg: #f8d7da;",
     "  --status-error-border: #f5c6cb;",
     "  --status-error-text: #721c24;",
+    "  --status-info-bg: #e0f2fe;",
+    "  --status-info-border: #7dd3fc;",
+    "  --status-info-text: #0369a1;",
 
     // Stream health indicator colors.
     "  --stream-healthy: #27ae60;",
@@ -143,10 +147,14 @@ export function generateThemeStyles(): string {
     "  --dark-text-muted: #999999;",
     "  --dark-text-error: #f44747;",
     "  --dark-text-warn: #dcdcaa;",
+    "  --dark-text-debug: #4ec9b0;",
     "  --dark-border: #3d3d3d;",
     "  --dark-scrollbar-track: #2d2d2d;",
     "  --dark-scrollbar-thumb: #555555;",
     "  --dark-scrollbar-thumb-hover: #666666;",
+
+    // Font stacks.
+    "  --font-mono: 'SF Mono', Monaco, monospace;",
 
     // Spacing and sizing tokens.
     "  --radius-sm: 3px;",
@@ -164,6 +172,7 @@ export function generateThemeStyles(): string {
     "    --surface-elevated: #2a2a2a;",
     "    --surface-sunken: #151515;",
     "    --surface-overlay: #2d2d2d;",
+    "    --surface-hover: #353535;",
     "    --surface-code: #2d2d2d;",
     "    --surface-pre: #252525;",
 
@@ -171,6 +180,7 @@ export function generateThemeStyles(): string {
     "    --text-primary: #e0e0e0;",
     "    --text-secondary: #b0b0b0;",
     "    --text-muted: #888888;",
+    "    --text-tertiary: #777777;",
     "    --text-disabled: #666666;",
     "    --text-heading: #ffffff;",
     "    --text-heading-secondary: #e0e0e0;",
@@ -189,6 +199,8 @@ export function generateThemeStyles(): string {
     "    --interactive-secondary-hover: #95a5a6;",
     "    --interactive-danger: #e74c3c;",
     "    --interactive-danger-hover: #c0392b;",
+    "    --interactive-success: #2ecc71;",
+    "    --interactive-success-hover: #27ae60;",
     "    --interactive-edit: #5bc0de;",
     "    --interactive-edit-hover: #46b8da;",
     "    --interactive-delete: #e74c3c;",
@@ -204,6 +216,9 @@ export function generateThemeStyles(): string {
     "    --status-error-bg: #3d2020;",
     "    --status-error-border: #5a2a2a;",
     "    --status-error-text: #f5a5a5;",
+    "    --status-info-bg: #1e2d3d;",
+    "    --status-info-border: #2a4a5a;",
+    "    --status-info-text: #7dc4f5;",
 
     // Stream health indicator colors - same in dark mode for consistency.
     "    --stream-healthy: #2ecc71;",

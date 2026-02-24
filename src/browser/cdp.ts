@@ -9,10 +9,7 @@ import { CONFIG } from "../config/index.js";
 import { getBrowserChrome } from "./display.js";
 import { getEffectiveViewport } from "../config/presets.js";
 
-/*
- * CDP SESSION HELPERS
- *
- * The Chrome DevTools Protocol (CDP) provides low-level access to Chrome's internal state and capabilities. While Puppeteer abstracts most common operations, some
+/* The Chrome DevTools Protocol (CDP) provides low-level access to Chrome's internal state and capabilities. While Puppeteer abstracts most common operations, some
  * features require direct CDP access:
  *
  * - Window management: Setting window size, position, and state (minimized, maximized, fullscreen). Puppeteer's viewport API controls the content area, but we
@@ -77,7 +74,7 @@ export async function withCDPSession<T>(
 
     // "No target with given id" is a common error that occurs when the page closes during our operation. This is expected during stream termination and
     // shouldn't be logged as a warning since it's not actionable. We also check if the page is closed, as errors during page closure are expected.
-    if((message.indexOf("No target with given id") === -1) && !page.isClosed()) {
+    if(!message.includes("No target with given id") && !page.isClosed()) {
 
       LOG.warn("CDP operation failed: %s.", message);
     }

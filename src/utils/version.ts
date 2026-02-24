@@ -59,7 +59,7 @@ let updateCheckInterval: Nullable<ReturnType<typeof setInterval>> = null;
  * @param version - Version string (e.g., "v1.0.7" or "1.0.7").
  * @returns Normalized version without 'v' prefix (e.g., "1.0.7").
  */
-function normalizeVersion(version: string): string {
+export function normalizeVersion(version: string): string {
 
   return version.replace(/^v/, "");
 }
@@ -70,7 +70,7 @@ function normalizeVersion(version: string): string {
  * @param b - Second version string (e.g., "1.0.8").
  * @returns True if a < b.
  */
-function isVersionLessThan(a: string, b: string): boolean {
+export function isVersionLessThan(a: string, b: string): boolean {
 
   const partsA = a.split(".").map(Number);
   const partsB = b.split(".").map(Number);
@@ -98,7 +98,7 @@ function isVersionLessThan(a: string, b: string): boolean {
  * Fetches the latest version from the npm registry.
  * @returns The latest version string, or null if the fetch failed.
  */
-async function fetchLatestVersion(): Promise<Nullable<string>> {
+export async function fetchLatestVersion(): Promise<Nullable<string>> {
 
   try {
 
@@ -115,7 +115,7 @@ async function fetchLatestVersion(): Promise<Nullable<string>> {
     return latest ? normalizeVersion(latest) : null;
   } catch(error) {
 
-    LOG.debug("Failed to fetch latest version from npm: %s.", formatError(error));
+    LOG.debug("config", "Failed to fetch latest version from npm: %s.", formatError(error));
 
     return null;
   }
@@ -139,7 +139,7 @@ async function fetchChangelogContent(): Promise<Nullable<string>> {
     return await response.text();
   } catch(error) {
 
-    LOG.debug("Failed to fetch changelog from GitHub: %s.", formatError(error));
+    LOG.debug("config", "Failed to fetch changelog from GitHub: %s.", formatError(error));
 
     return null;
   }
@@ -299,15 +299,8 @@ export function startUpdateChecking(currentVersion: string): void {
   // Do an initial check.
   void checkForUpdates(current);
 
-  // Set up periodic checking. We use an if statement rather than ??= to ensure setInterval is only called when needed (lazy evaluation).
-  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing, logical-assignment-operators
-  if(!updateCheckInterval) {
-
-    updateCheckInterval = setInterval(() => {
-
-      void checkForUpdates(current);
-    }, UPDATE_CHECK_INTERVAL);
-  }
+  // Set up periodic checking.
+  updateCheckInterval ??= setInterval(() => void checkForUpdates(current), UPDATE_CHECK_INTERVAL);
 }
 
 /**

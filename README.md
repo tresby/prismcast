@@ -71,12 +71,36 @@ If you're already using Chrome Capture for Channels and it's working well for yo
 
 ## Installation
 
-PrismCast can be installed as a Node.js package or deployed as a Docker container. For Docker, see [Docker / Container Deployment](#docker--container-deployment) below.
+PrismCast can be installed via Homebrew on macOS, as a Node.js package on any platform, or deployed as a Docker container. For Docker, see [Docker / Container Deployment](#docker--container-deployment) below.
 
-The recommended approach for native installation is to install PrismCast globally and run it as a system service:
+### Homebrew (macOS)
+
+The recommended way to install PrismCast on macOS:
+
+```sh
+brew install hjdhjd/prismcast/prismcast
+```
+
+To update to the latest version, use the built-in upgrade command or Homebrew directly:
+
+```sh
+prismcast upgrade
+# or: brew upgrade prismcast
+```
+
+### npm (All Platforms)
+
+PrismCast can also be installed globally as a Node.js package:
 
 ```sh
 npm install -g prismcast
+```
+
+To upgrade to the latest version, use the built-in upgrade command or npm directly:
+
+```sh
+prismcast upgrade
+# or: npm install -g prismcast
 ```
 
 Once installed, you can start PrismCast with:
@@ -85,7 +109,30 @@ Once installed, you can start PrismCast with:
 prismcast
 ```
 
+### CLI Options
+
+```
+prismcast [options]
+
+Options:
+  -c, --console                   Log to console instead of file (for Docker or debugging)
+  -d, --debug                     Enable debug logging (verbose output for troubleshooting)
+  -h, --help                      Show this help message
+  -p, --port <port>               Set server port (default: 5589)
+  -v, --version                   Show version number
+  --chrome-data-dir <path>        Set Chrome profile data directory (default: <data-dir>/chromedata)
+  --data-dir <path>               Set data directory (default: ~/.prismcast)
+  --list-env                      List all environment variables
+  --log-file <path>               Set log file path (default: <data-dir>/prismcast.log)
+
+Subcommands:
+  prismcast service <action>      Manage the PrismCast service (install, uninstall, start, stop, restart, status)
+  prismcast upgrade [options]     Upgrade PrismCast to the latest version (--check, --force)
+```
+
 ### Running as a Service
+
+After upgrading PrismCast, restart the service to pick up the new version. If PrismCast is running as a service, `prismcast upgrade` will restart it automatically.
 
 For the best experience, install PrismCast as a service that starts automatically at login:
 
@@ -115,7 +162,7 @@ prismcast service uninstall # Remove the service
    - Enter: `http://<your-prismcast-host>:5589/playlist`
    - Set Stream Format to **HLS**
 
-That's it! Your channels will appear in the Channels DVR guide.
+That's it! Your channels will appear in the Channels DVR guide. Channels with a channel number configured in PrismCast will include it in the playlist for guide mapping.
 
 ## Quick Start with Plex
 
@@ -132,16 +179,17 @@ HDHomeRun emulation requires FFmpeg capture mode (the default). It is automatica
 
 ## Configuration
 
-PrismCast includes a web-based configuration interface at `http://localhost:5589/#config`. From there you can:
+PrismCast includes a web-based configuration interface at `http://localhost:5589`. From there you can:
 
 - **Manage channels** - View all available channels, add your own custom channels, or override the defaults
+- **Filter providers** - Choose which streaming services are active in your environment and filter channels accordingly
 - **Adjust quality settings** - Choose from presets like 720p, 1080p, or 4K
 - **Configure HLS parameters** - Segment duration, buffer size, idle timeout
 - **Configure HDHomeRun** - Enable or disable Plex integration, set the HDHR port and device name
 - **Tune recovery behavior** - Adjust how aggressively PrismCast recovers from playback issues
 - **Backup and restore** - Download your configuration for safekeeping
 
-Configuration is stored in `~/.prismcast/config.json` and your TV provider sessions are preserved in `~/.prismcast/chromedata/`.
+Configuration is stored in `~/.prismcast/config.json` and your TV provider sessions are preserved in `~/.prismcast/chromedata/`. These paths can be customized via CLI flags (`--data-dir`, `--chrome-data-dir`, `--log-file`) or environment variables — run `prismcast --list-env` to see all available options.
 
 ## Platform Support
 
@@ -153,7 +201,7 @@ Configuration is stored in `~/.prismcast/config.json` and your TV provider sessi
 
 ## Docker / Container Deployment
 
-PrismCast provides a prebuilt Docker image with everything included: Google Chrome, a virtual display (Xvfb), VNC access, and a browser-based noVNC interface for managing TV provider authentication. The image is available on [Docker Hub](https://hub.docker.com/r/bnhf/prismcast).
+PrismCast provides a prebuilt Docker image with everything included: Google Chrome, a virtual display (Xvfb), VNC access, and a browser-based noVNC interface for managing TV provider authentication. The image is available on [GitHub Container Registry](https://github.com/hjdhjd/prismcast/pkgs/container/prismcast).
 
 ### Quick Start with Docker Compose
 
@@ -193,7 +241,7 @@ docker run -d \
   -p 6080:6080 \
   -p 5004:5004 \
   -v prismcast-data:/root/.prismcast \
-  bnhf/prismcast:latest
+  ghcr.io/hjdhjd/prismcast:latest
 ```
 
 ### Ports
@@ -258,6 +306,11 @@ The container accepts environment variables for both the virtual display and Pri
 | `HLS_MAX_SEGMENTS` | 10 | Maximum segments kept in memory per stream |
 | `HLS_IDLE_TIMEOUT` | 30000 | Idle stream timeout in milliseconds |
 | `MAX_CONCURRENT_STREAMS` | 10 | Maximum simultaneous streams |
+| `PRISMCAST_DATA_DIR` | /root/.prismcast | Data directory for configuration, channels, and logs |
+| `PRISMCAST_CHROME_DATA_DIR` | (data-dir)/chromedata | Chrome profile directory for TV provider sessions |
+| `PRISMCAST_LOG_FILE` | (data-dir)/prismcast.log | Log file path |
+
+Run `prismcast --list-env` inside the container for a complete listing of all available environment variables.
 
 ### Persistent Storage
 
@@ -269,6 +322,23 @@ The compose file mounts a Docker volume at `/root/.prismcast`, which stores:
 - **Logs** - `prismcast.log` for troubleshooting
 
 This volume persists across container restarts and image updates. Back up this volume to preserve your configuration and login sessions.
+
+### Updating
+
+To update to the latest PrismCast image using Docker Compose:
+
+```bash
+docker compose -f prismcast.yaml pull
+docker compose -f prismcast.yaml up -d
+```
+
+If you use `docker run`, pull the latest image and recreate the container:
+
+```bash
+docker pull ghcr.io/hjdhjd/prismcast:latest
+```
+
+Then re-run your original `docker run` command. The persistent volume preserves your configuration, channels, and login sessions across updates.
 
 ### Building from Source
 

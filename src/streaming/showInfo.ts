@@ -7,21 +7,18 @@ import type { Nullable } from "../types/index.js";
 import { getAllChannels } from "../config/userChannels.js";
 import { getAllStreams } from "./registry.js";
 
-/*
- * SHOW INFO POLLING
- *
- * This module integrates with the Channels DVR API to retrieve the names of shows for active streams. Show names are determined from two sources:
+/* This module integrates with the Channels DVR API to retrieve the names of shows for active streams. Show names are determined from two sources:
  *
  * 1. Active recordings (/dvr/jobs) - If Channels DVR is recording a channel, we get the show name from the recording job
  * 2. Program guide (/devices/{id}/guide/now) - For live viewing without recording, we fall back to the current program from the guide
  *
  * The polling mechanism uses a two-phase approach — discovery and lookup:
  *
- * 1. DISCOVERY: Every 30 seconds, try each unique client address as a potential Channels DVR server by calling getDeviceMappings(). If a host has matching M3U
+ * 1. Discovery: Every 30 seconds, try each unique client address as a potential Channels DVR server by calling getDeviceMappings(). If a host has matching M3U
  *    devices, cache it as the last known DVR host. Device mappings are cached for 5 minutes, so non-DVR hosts (e.g., Plex IPs) only incur a network timeout on the
  *    first attempt and every 5 minutes thereafter.
  *
- * 2. LOOKUP: Use the cached DVR host for show name and logo lookups across ALL active streams, regardless of which client initiated them. This enables Plex-initiated
+ * 2. Lookup: Use the cached DVR host for show name and logo lookups across ALL active streams, regardless of which client initiated them. This enables Plex-initiated
  *    streams to display show names and logos from the Channels DVR guide, as long as any Channels DVR connection has been seen at some point.
  *
  * Caching strategy:
@@ -277,7 +274,7 @@ async function updateShowNames(): Promise<void> {
   }
 
   // Collect all stream entries for lookup and unique client addresses for DVR host discovery.
-  const allStreamEntries: Array<{ channelKey: string; id: number }> = [];
+  const allStreamEntries: { channelKey: string; id: number }[] = [];
   const discoveryHosts = new Set<string>();
 
   for(const stream of streams) {
@@ -327,7 +324,7 @@ async function updateShowNames(): Promise<void> {
  * @param host - The DVR server hostname or IP address.
  * @param hostStreams - Array of streams from this host with their channel keys.
  */
-async function updateShowNamesForHost(host: string, hostStreams: Array<{ channelKey: string; id: number }>): Promise<void> {
+async function updateShowNamesForHost(host: string, hostStreams: { channelKey: string; id: number }[]): Promise<void> {
 
   // Ensure we have fresh device mappings.
   const mappings = await getDeviceMappings(host);
@@ -385,7 +382,7 @@ async function updateShowNamesForHost(host: string, hostStreams: Array<{ channel
 
         showNameCache.set(stream.id, showName);
 
-        LOG.debug("Show name for stream %d (%s): %s.", stream.id, stream.channelKey, showName);
+        LOG.debug("streaming:showinfo", "Show name for stream %d (%s): %s.", stream.id, stream.channelKey, showName);
       }
     } else {
 
@@ -394,7 +391,7 @@ async function updateShowNamesForHost(host: string, hostStreams: Array<{ channel
 
         showNameCache.delete(stream.id);
 
-        LOG.debug("Cleared show name for stream %d (%s): no matching program.", stream.id, stream.channelKey);
+        LOG.debug("streaming:showinfo", "Cleared show name for stream %d (%s): no matching program.", stream.id, stream.channelKey);
       }
     }
   }
@@ -440,37 +437,33 @@ async function getDeviceMappings(host: string): Promise<Map<string, Map<string, 
       continue;
     }
 
-    // Check if this device's channel IDs exactly match PrismCast's channels. This identifies our M3U source and avoids misidentification when the user has multiple
-    // M3U sources in Channels DVR.
+    // Identify PrismCast's M3U source by measuring channel ID overlap. We use overlap-based matching rather than exact matching because the channel set can drift:
+    // the user may disable channels after Channels DVR imports the playlist, or add new channels that haven't been refreshed yet in the DVR. We count how many of
+    // PrismCast's channel keys appear in the device, and accept the device if overlap exceeds 80% of the larger set.
     const deviceChannelIds = new Set(device.Channels.map((ch) => ch.ID));
+    let overlapCount = 0;
 
-    if(deviceChannelIds.size !== prismcastChannelKeys.size) {
+    for(const key of prismcastChannelKeys) {
 
-      LOG.debug("Skipping M3U device %s: channel count mismatch (%d vs %d).", device.DeviceID, deviceChannelIds.size, prismcastChannelKeys.size);
+      if(deviceChannelIds.has(key)) {
 
-      continue;
-    }
-
-    let allMatch = true;
-
-    for(const channelId of deviceChannelIds) {
-
-      if(!prismcastChannelKeys.has(channelId)) {
-
-        allMatch = false;
-
-        break;
+        overlapCount++;
       }
     }
 
-    if(!allMatch) {
+    const maxSize = Math.max(deviceChannelIds.size, prismcastChannelKeys.size);
+    const overlapRatio = overlapCount / maxSize;
 
-      LOG.debug("Skipping M3U device %s: channel IDs do not match PrismCast channels.", device.DeviceID);
+    if(overlapRatio < 0.8) {
+
+      LOG.debug("streaming:showinfo", "Skipping M3U device %s: low channel overlap (%d/%d = %d%%).",
+        device.DeviceID, overlapCount, maxSize, Math.round(overlapRatio * 100));
 
       continue;
     }
 
-    LOG.debug("Matched M3U device %s as PrismCast source (%d channels).", device.DeviceID, device.Channels.length);
+    LOG.debug("streaming:showinfo", "Matched M3U device %s as PrismCast source (%d channels, %d%% overlap).",
+      device.DeviceID, device.Channels.length, Math.round(overlapRatio * 100));
 
     // Build guide number → channel ID map for this device and cache logo URLs.
     const guideToChannelId = new Map<string, string>();
@@ -499,7 +492,7 @@ async function getDeviceMappings(host: string): Promise<Map<string, Map<string, 
   // Cache the mappings and device IDs.
   deviceMappingsByHost.set(host, { deviceIds, lastRefresh: now, mappings });
 
-  LOG.debug("Refreshed device mappings from %s: %d M3U device(s), %d channel(s).", host, mappings.size, totalChannels);
+  LOG.debug("streaming:showinfo", "Refreshed device mappings from %s: %d M3U device(s), %d channel(s).", host, mappings.size, totalChannels);
 
   return mappings;
 }
@@ -541,7 +534,7 @@ async function getGuideShowNames(host: string): Promise<Map<string, string>> {
     }
   }
 
-  LOG.debug("Fetched guide data from %s: %d channel(s) with current programs.", host, showNames.size);
+  LOG.debug("streaming:showinfo", "Fetched guide data from %s: %d channel(s) with current programs.", host, showNames.size);
 
   return showNames;
 }
@@ -559,7 +552,7 @@ async function fetchFromDvr<T>(host: string, path: string): Promise<T[]> {
   try {
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+    const timeoutId = setTimeout(() => { controller.abort(); }, API_TIMEOUT_MS);
 
     const response = await fetch(url, {
 
@@ -582,7 +575,7 @@ async function fetchFromDvr<T>(host: string, path: string): Promise<T[]> {
       // Don't log abort errors (timeouts) - they're expected for unreachable servers.
       if(error.name !== "AbortError") {
 
-        LOG.debug("Failed to fetch %s from %s: %s.", path, host, formatError(error));
+        LOG.debug("streaming:showinfo", "Failed to fetch %s from %s: %s.", path, host, formatError(error));
       }
     }
 

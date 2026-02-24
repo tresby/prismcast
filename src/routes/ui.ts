@@ -4,10 +4,7 @@
  */
 import { generateThemeStyles } from "./theme.js";
 
-/*
- * SHARED UI COMPONENTS
- *
- * This module provides reusable UI components used across PrismCast web pages. It ensures consistent styling and behavior between the landing page and
+/* This module provides reusable UI components used across PrismCast web pages. It ensures consistent styling and behavior between the landing page and
  * configuration page by extracting common CSS and JavaScript patterns. All styles use CSS custom properties from theme.ts for automatic dark mode support.
  */
 
@@ -90,6 +87,8 @@ export function generateBaseStyles(): string {
     ".btn-secondary:hover { background: var(--interactive-secondary-hover); }",
     ".btn-danger { background: var(--interactive-danger); color: var(--text-inverse); }",
     ".btn-danger:hover { background: var(--interactive-danger-hover); }",
+    ".btn-success { background: var(--interactive-success); color: var(--text-inverse); }",
+    ".btn-success:hover { background: var(--interactive-success-hover); }",
     ".btn-edit { background: var(--interactive-edit); color: var(--text-inverse); }",
     ".btn-edit:hover { background: var(--interactive-edit-hover); }",
     ".btn-delete { background: var(--interactive-delete); color: var(--text-inverse); }",

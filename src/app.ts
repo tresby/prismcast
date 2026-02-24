@@ -4,38 +4,37 @@
  */
 import { CONFIG, displayConfiguration, initializeConfiguration, validateConfiguration } from "./config/index.js";
 import type { Express, NextFunction, Request, Response } from "express";
-import { LOG, createMorganStream, formatError, getPackageVersion, resolveFFmpegPath, setConsoleLogging, startUpdateChecking, stopUpdateChecking } from "./utils/index.js";
-import { closeBrowser, ensureDataDirectory, getCurrentBrowser, killStaleChrome, prepareExtension, setGracefulShutdown, startStalePageCleanup,
-  stopStalePageCleanup } from "./browser/index.js";
+import { LOG, createMorganStream, formatError, getCurrentPattern, getPackageVersion, isDebugLogging, resolveFFmpegPath, setConsoleLogging,
+  startUpdateChecking, stopUpdateChecking } from "./utils/index.js";
+import { closeBrowser, ensureDataDirectory, getCurrentBrowser, killStaleChrome, minimizeBrowserWindow, prepareExtension, setGracefulShutdown,
+  startBrowserRestartChecking, startStalePageCleanup, stopBrowserRestartChecking, stopStalePageCleanup } from "./browser/index.js";
 import { initializeFileLogger, shutdownFileLogger } from "./utils/fileLogger.js";
 import { startHdhrServer, stopHdhrServer } from "./hdhr/index.js";
 import { startShowInfoPolling, stopShowInfoPolling } from "./streaming/showInfo.js";
+import type { CliOverrides } from "./config/index.js";
 import type { Nullable } from "./types/index.js";
+import type { ParsedArgs } from "./index.js";
 import type { Server } from "http";
 import { cleanupIdleStreams } from "./streaming/hls.js";
 import consoleStamp from "console-stamp";
 import express from "express";
 import { getAllStreams } from "./streaming/registry.js";
+import { getLogFilePath } from "./config/paths.js";
 import { initializeUserChannels } from "./config/userChannels.js";
 import morgan from "morgan";
 import { setupRoutes } from "./routes/index.js";
 import { terminateStream } from "./streaming/lifecycle.js";
 import { validateProfiles } from "./config/profiles.js";
+import { verifyCaptureSystem } from "./streaming/setup.js";
 
-/*
- * LOGGING MODE
- *
- * The logging mode is set at startup based on the --console CLI flag. When console logging is enabled, timestamps are added via console-stamp and output goes to
- * stdout/stderr. When file logging is used (the default), output goes to ~/.prismcast/prismcast.log.
+/* The logging mode is set at startup based on the --console CLI flag. When console logging is enabled, timestamps are added via console-stamp and output goes to
+ * stdout/stderr. When file logging is used (the default), output goes to the configured log file (default: prismcast.log in the data directory).
  */
 
 // Track whether console logging is enabled, set during startServer().
 let usingConsoleLogging = false;
 
-/*
- * APPLICATION STATE
- *
- * The HTTP server instance is stored globally so it can be closed during graceful shutdown.
+/* The HTTP server instance is stored globally so it can be closed during graceful shutdown.
  */
 
 let server: Nullable<Server> = null;
@@ -72,10 +71,7 @@ function stopIdleCleanup(): void {
   }
 }
 
-/*
- * GRACEFUL SHUTDOWN
- *
- * When the process receives a termination signal, we close all active streams and the browser before exiting. This ensures resources are released cleanly.
+/* When the process receives a termination signal, we close all active streams and the browser before exiting. This ensures resources are released cleanly.
  */
 
 /**
@@ -102,6 +98,7 @@ function setupGracefulShutdown(): void {
 
     // Stop cleanup and polling intervals.
     stopHdhrServer();
+    stopBrowserRestartChecking();
     stopStalePageCleanup();
     stopIdleCleanup();
     stopShowInfoPolling();
@@ -153,10 +150,7 @@ function setupGracefulShutdown(): void {
   });
 }
 
-/*
- * APPLICATION BUILDER
- *
- * The buildApp function creates and configures the Express application with all middleware and routes. This is separated from the server startup to allow for
+/* The buildApp function creates and configures the Express application with all middleware and routes. This is separated from the server startup to allow for
  * testing and flexibility in deployment.
  */
 
@@ -306,34 +300,49 @@ async function buildApp(): Promise<Express> {
   return app;
 }
 
-/*
- * SERVER STARTUP
- *
- * The startServer function initializes and starts the HTTP server. It validates configuration, cleans up stale processes, warms up the browser, and starts the
+/* The startServer function initializes and starts the HTTP server. It validates configuration, cleans up stale processes, warms up the browser, and starts the
  * Express application.
  */
 
 /**
  * Initializes and starts the HTTP server. Before accepting connections, we validate configuration, clean up stale Chrome processes, and warm up the browser
  * instance.
- * @param useConsoleLogging - Whether to log to console instead of file. Defaults to false (file logging).
+ * @param parsedArgs - Parsed command-line arguments containing flags and override values.
  */
-export async function startServer(useConsoleLogging = false): Promise<void> {
+export async function startServer(parsedArgs: ParsedArgs): Promise<void> {
 
   // Set logging mode early before any log calls.
-  usingConsoleLogging = useConsoleLogging;
-  setConsoleLogging(useConsoleLogging);
+  usingConsoleLogging = parsedArgs.consoleLogging;
+  setConsoleLogging(parsedArgs.consoleLogging);
 
   // Apply console-stamp for timestamps only when using console logging.
-  if(useConsoleLogging) {
+  if(parsedArgs.consoleLogging) {
 
     consoleStamp(console, { format: ":date(yyyy/mm/dd HH:MM:ss.l)" });
   }
 
-  // Initialize configuration from file and environment variables, then validate.
+  // Build CLI overrides from parsed arguments. These have the highest priority in the merge order (CLI > env > config.json > defaults).
+  const cliOverrides: CliOverrides = {};
+
+  if(parsedArgs.chromeDataDir !== undefined) {
+
+    cliOverrides["paths.chromeDataDir"] = parsedArgs.chromeDataDir;
+  }
+
+  if(parsedArgs.logFile !== undefined) {
+
+    cliOverrides["paths.logFile"] = parsedArgs.logFile;
+  }
+
+  if(parsedArgs.port !== undefined) {
+
+    cliOverrides["server.port"] = parsedArgs.port;
+  }
+
+  // Initialize configuration from file and environment variables, then validate. CLI overrides are applied as the highest-priority merge pass.
   try {
 
-    await initializeConfiguration();
+    await initializeConfiguration(cliOverrides);
     validateConfiguration();
     validateProfiles();
   } catch(error) {
@@ -343,16 +352,36 @@ export async function startServer(useConsoleLogging = false): Promise<void> {
     process.exit(1);
   }
 
-  displayConfiguration();
   setupGracefulShutdown();
 
   // Ensure the data directory exists before any operations that depend on it.
   await ensureDataDirectory();
 
-  // Initialize file logger if not using console logging.
-  if(!useConsoleLogging) {
+  // Initialize file logger if not using console logging. This must happen after config loading (to resolve the log file path) and after ensureDataDirectory()
+  // (to create the parent directory). All startup log messages that should appear in the log file must come after this point.
+  if(!parsedArgs.consoleLogging) {
 
-    await initializeFileLogger(CONFIG.logging.maxSize);
+    await initializeFileLogger(getLogFilePath(CONFIG), CONFIG.logging.maxSize);
+  }
+
+  // Log the version and active configuration as the first messages captured by the file logger.
+  displayConfiguration();
+
+  // Log the debug filter status after the file logger is ready so the message is captured.
+  if(isDebugLogging()) {
+
+    const debugEnv = process.env.PRISMCAST_DEBUG;
+
+    if(debugEnv) {
+
+      LOG.info("Debug logging enabled with filter: %s (from PRISMCAST_DEBUG).", debugEnv);
+    } else if((CONFIG.logging.debugFilter.length > 0) && (getCurrentPattern() === CONFIG.logging.debugFilter)) {
+
+      LOG.info("Debug logging enabled with filter: %s (from config).", CONFIG.logging.debugFilter);
+    } else {
+
+      LOG.info("Debug logging enabled for all categories.");
+    }
   }
 
   // Check FFmpeg availability if using FFmpeg capture mode. This must be after file logger initialization so the log message is captured.
@@ -371,7 +400,7 @@ export async function startServer(useConsoleLogging = false): Promise<void> {
     LOG.info("Using FFmpeg at: %s", ffmpegPath);
   }
 
-  // Load user channels from ~/.prismcast/channels.json if it exists.
+  // Load user channels from channels.json in the data directory if it exists.
   await initializeUserChannels();
 
   killStaleChrome();
@@ -387,8 +416,28 @@ export async function startServer(useConsoleLogging = false): Promise<void> {
     throw error;
   }
 
+  // Verify the capture system works before accepting requests. This detects stale tabCapture state from a previous Chrome process and exits immediately if
+  // found, since the puppeteer-stream mutex would be permanently leaked. The probe also ensures the STOP_RECORDING cleanup chain completes before returning.
+  try {
+
+    await verifyCaptureSystem();
+  } catch(error) {
+
+    LOG.error("Capture system verification failed during startup: %s.", formatError(error));
+
+    throw error;
+  }
+
+  // Minimize the browser window to reduce GPU usage and desktop clutter. The browser must be visible (not headless) for capture to work, but minimizing it reduces
+  // resource consumption. CDP allows us to control window state without affecting capture. We defer minimization until after display detection and capture
+  // verification complete, since both require the window in a normal state.
+  await minimizeBrowserWindow();
+
   // Start stale page cleanup.
   startStalePageCleanup();
+
+  // Start browser restart checking.
+  startBrowserRestartChecking();
 
   // Start idle cleanup.
   startIdleCleanup();

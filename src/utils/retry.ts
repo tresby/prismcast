@@ -6,10 +6,7 @@ import { formatError, isSessionClosedError } from "./errors.js";
 import { CONFIG } from "../config/index.js";
 import { LOG } from "./logger.js";
 
-/*
- * RETRY LOGIC
- *
- * The retry system provides resilient operation execution with exponential backoff and jitter. When operations fail due to transient issues like network hiccups or
+/* The retry system provides resilient operation execution with exponential backoff and jitter. When operations fail due to transient issues like network hiccups or
  * slow page loads, the system automatically retries with increasing delays. The exponential backoff prevents overwhelming struggling services, while jitter prevents
  * multiple clients from synchronizing their retry attempts.
  */
@@ -35,7 +32,7 @@ export async function retryOperation<T>(
   description: string,
   earlySuccessCheck?: () => Promise<boolean>,
   shouldAbort?: () => boolean
-): Promise<T | void> {
+): Promise<T | undefined> {
 
   let lastError: unknown = null;
 
@@ -49,7 +46,7 @@ export async function retryOperation<T>(
 
     if(attempt > 1) {
 
-      LOG.info("Retrying %s (attempt %s of %s).", description, attempt, maxAttempts);
+      LOG.debug("retry", "Retrying %s (attempt %s of %s).", description, attempt, maxAttempts);
     }
 
     try {
@@ -72,14 +69,14 @@ export async function retryOperation<T>(
       // If the page or session was closed, retrying is pointless. Abort immediately without warning since we're not going to retry.
       if(isSessionClosedError(error)) {
 
-        LOG.info("Page was closed, aborting retries for %s.", description);
+        LOG.debug("retry", "Page was closed, aborting retries for %s.", description);
 
         throw error;
       }
 
       // For timeout errors, check if the operation actually succeeded despite the timeout. This handles cases where the page loaded and video started playing, but
       // some wait condition like networkidle2 never completed. We check this before logging a warning because if early success passes, there's nothing to warn about.
-      if(earlySuccessCheck && (formatError(error).indexOf("timed out") !== -1)) {
+      if(earlySuccessCheck && formatError(error).includes("timed out")) {
 
         try {
 

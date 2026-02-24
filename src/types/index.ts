@@ -11,10 +11,7 @@ import type { RecoveryMetrics } from "../streaming/monitor.js";
  */
 export type Nullable<T> = T | null;
 
-/*
- * CONFIGURATION TYPES
- *
- * These interfaces define the structure of the application configuration. The Config interface is the root configuration object, with nested interfaces for each
+/* These interfaces define the structure of the application configuration. The Config interface is the root configuration object, with nested interfaces for each
  * functional area. All configuration values are loaded from environment variables with sensible defaults. The configuration is validated at startup to catch
  * misconfigurations before the server begins accepting connections.
  */
@@ -40,13 +37,21 @@ export interface BrowserConfig {
  */
 export interface PathsConfig {
 
-  // Directory name for Chrome's user data (profile, cookies, cache). This directory persists across restarts, allowing sites to remember login state. The directory
-  // is created inside the application's data directory. Chrome locks this directory while running, so we kill stale processes on startup.
+  // Absolute path override for Chrome's user data directory (profile, cookies, cache), or null to use the default location inside the data directory. When null,
+  // the directory is built as <dataDir>/<chromeProfileName>. Setting this allows storing Chrome data on a different volume or sharing a profile across instances.
+  chromeDataDir: Nullable<string>;
+
+  // Directory name for Chrome's user data within the data directory. Only used when chromeDataDir is null. Chrome locks this directory while running, so we kill
+  // stale processes on startup.
   chromeProfileName: string;
 
   // Directory name for extracted puppeteer-stream extension files. When running as a packaged executable, extension files must be extracted to the filesystem
   // because Chrome cannot load extensions from within the executable archive.
   extensionDirName: string;
+
+  // Absolute path override for the log file, or null to use the default location (<dataDir>/prismcast.log). Setting this allows writing logs to a different
+  // volume or a centralized log directory.
+  logFile: Nullable<string>;
 }
 
 /**
@@ -169,6 +174,10 @@ export interface ChannelsConfig {
 
   // List of predefined channel keys that are disabled. Disabled channels are excluded from the playlist and cannot be streamed.
   disabledPredefined: string[];
+
+  // Provider tags that are enabled for filtering. Empty array means no filter (all providers shown). Non-empty means only channels with at least one matching
+  // provider variant are included in the playlist and guide.
+  enabledProviders: string[];
 }
 
 /**
@@ -199,6 +208,10 @@ export interface HdhrConfig {
  * Logging configuration controlling file-based logging behavior.
  */
 export interface LoggingConfig {
+
+  // Active debug filter pattern persisted from the /debug UI. When non-empty at startup and no higher-priority source (PRISMCAST_DEBUG env var or --debug CLI
+  // flag) is active, this pattern is applied via initDebugFilter(). Managed by the /debug endpoint, not shown in the Settings/Advanced config UI.
+  debugFilter: string;
 
   // Controls HTTP request logging level. "none" disables HTTP request logging, "errors" logs only 4xx and 5xx responses, "filtered" logs important requests
   // while skipping high-frequency endpoints like /logs and /health, "all" logs all requests. Environment variable: HTTP_LOG_LEVEL. Default: "errors".
@@ -315,10 +328,7 @@ export interface Config {
   streaming: StreamingConfig;
 }
 
-/*
- * SITE PROFILE TYPES
- *
- * Site profiles define behavior patterns for different streaming site implementations. Television network streaming sites vary widely in their player
+/* Site profiles define behavior patterns for different streaming site implementations. Television network streaming sites vary widely in their player
  * implementations: some use keyboard shortcuts for fullscreen, others require the JavaScript Fullscreen API; some embed video in iframes, others place it directly
  * in the page; some auto-mute videos and fight attempts to unmute them. The profile system captures these behavioral differences as configuration rather than
  * code, making it easy to add support for new sites by defining their characteristics.
@@ -328,10 +338,22 @@ export interface Config {
  */
 
 /**
+ * UI category for profile grouping in dropdowns and reference documentation. Profiles are grouped by their fullscreen mechanism and special characteristics.
+ * - "api": Profiles using the JavaScript fullscreen API (including embedded iframe and click-to-play variants).
+ * - "keyboard": Profiles using keyboard shortcuts (typically the 'f' key) for fullscreen.
+ * - "multiChannel": Multi-channel profiles requiring a channel selector for tile or thumbnail-based channel selection.
+ * - "special": Special-purpose profiles like static page capture.
+ */
+export type ProfileCategory = "api" | "keyboard" | "multiChannel" | "special";
+
+/**
  * Site profile definition with optional flags. All flags are optional because profiles can inherit from other profiles, and only the flags that differ from the
  * parent need to be specified. The DEFAULT_SITE_PROFILE provides baseline values for any flags not set through inheritance.
  */
 export interface SiteProfile {
+
+  // UI category for grouping this profile in dropdowns and reference documentation. This is metadata only - it's stripped during profile resolution.
+  category?: ProfileCategory;
 
   // Configuration for channel selection behavior on multi-channel sites. When set, determines how to find and click the desired channel in the site's UI. The
   // strategy property specifies the algorithm used to locate the channel element.
@@ -341,8 +363,12 @@ export interface SiteProfile {
   // identifiers. The value typically comes from the channel definition rather than the profile itself.
   channelSelector?: Nullable<string>;
 
+  // CSS selector for the element to click when clickToPlay is true. Some sites have a play button overlay rather than a clickable video element. When set, this
+  // selector is clicked instead of the video element. When not set, the video element itself is clicked.
+  clickSelector?: Nullable<string>;
+
   // Whether the video player requires a click to start playback. Brightcove-based players commonly require this. When true, the stream handler clicks the video
-  // element after page load and before waiting for the video to become ready. This simulates user interaction to satisfy autoplay policies.
+  // element (or clickSelector target) after page load and before waiting for the video to become ready. This simulates user interaction to satisfy autoplay policies.
   clickToPlay?: boolean;
 
   // Human-readable description of the profile for documentation purposes. This field is stripped during profile resolution and not included in the resolved
@@ -360,6 +386,16 @@ export interface SiteProfile {
   // Keyboard key to press for fullscreen mode. Most video players use "f" for fullscreen. When set, the stream handler sends this keypress to the video element
   // after playback begins. Set to null to disable keyboard fullscreen and rely on CSS-based fullscreen styling instead.
   fullscreenKey?: Nullable<string>;
+
+  // CSS selector for a fullscreen button element to click. When set, this button is clicked before attempting keyboard or API fullscreen methods. This is useful
+  // for sites that have a native fullscreen button in their player UI (e.g., a "MAXIMIZE" button). The element is verified to exist before clicking, so toggle
+  // buttons that disappear after activation are handled gracefully.
+  fullscreenSelector?: Nullable<string>;
+
+  // CSS selector for site-specific overlay elements to hide during capture. When set, a persistent stylesheet is injected into the page that applies
+  // "display: none !important" to the matched elements. This is used for player controls, toolbars, or other overlays that remain visible during fullscreen and
+  // would otherwise appear in the captured stream. The selector supports standard CSS selector lists (comma-separated for multiple targets).
+  hideSelector?: Nullable<string>;
 
   // Whether to override the video element's volume properties to prevent auto-muting. Some sites (like France 24) aggressively mute videos and fight attempts to
   // unmute them by resetting volume on every state change. When true, we use Object.defineProperty to intercept volume property access and force the video to
@@ -400,14 +436,28 @@ export interface ResolvedSiteProfile {
   // The channel slug to match when selecting a channel, or null if not applicable.
   channelSelector: Nullable<string>;
 
+  // CSS selector for the element to click when clickToPlay is true, or null to click the video element.
+  clickSelector: Nullable<string>;
+
   // Whether to click the video element to initiate playback.
   clickToPlay: boolean;
 
   // Keyboard key for fullscreen, or null to use CSS-based fullscreen.
   fullscreenKey: Nullable<string>;
 
+  // CSS selector for a fullscreen button to click, or null if not applicable.
+  fullscreenSelector: Nullable<string>;
+
+  // CSS selector for overlay elements to hide during capture, or null if not applicable.
+  hideSelector: Nullable<string>;
+
   // Whether to override volume properties to prevent auto-muting.
   lockVolumeProperties: boolean;
+
+  // Maximum continuous playback duration in hours before the site enforces a stream cutoff, or null if the site allows indefinite playback. When set, the monitor
+  // proactively reloads the page before this limit expires to maintain uninterrupted streaming. Only full page navigations reset the timer — source reloads do not.
+  // This value is sourced from DOMAIN_CONFIG rather than site profiles because it represents a site policy, not a player behavior characteristic.
+  maxContinuousPlayback: Nullable<number>;
 
   // Whether to search iframes for the video element.
   needsIframeHandling: boolean;
@@ -438,10 +488,7 @@ export interface ProfileResolutionResult {
   profileName: string;
 }
 
-/*
- * CHANNEL TYPES
- *
- * Channels map short URL-friendly names to streaming site URLs with optional metadata. The channel name appears in stream URLs (e.g., /stream/nbc) and must be
+/* Channels map short URL-friendly names to streaming site URLs with optional metadata. The channel name appears in stream URLs (e.g., /stream/nbc) and must be
  * URL-safe. Channel definitions can override profile settings for specific channels and provide metadata for M3U playlist generation.
  */
 
@@ -450,8 +497,8 @@ export interface ProfileResolutionResult {
  */
 export interface Channel {
 
-  // Numeric channel number for HDHomeRun/Plex guide matching. When set, this number is used as the GuideNumber in the HDHomeRun lineup, enabling Plex to match
-  // the channel with electronic program guide data. When omitted, a number is auto-assigned. Only relevant when HDHomeRun emulation is enabled.
+  // Numeric channel number for guide matching. When set, this number is used as the channel-number in the M3U playlist for Channels DVR and as the GuideNumber in
+  // the HDHomeRun lineup for Plex. When omitted, no channel number is included in the M3U playlist and a number is auto-assigned for HDHomeRun.
   channelNumber?: number;
 
   // CSS selector for channel selection within a multi-channel player. This overrides any channelSelector in the profile. Used for sites like Pluto TV where the
@@ -459,16 +506,24 @@ export interface Channel {
   channelSelector?: string;
 
   // Human-readable channel name displayed in the M3U playlist. This is what users see in their channel guide. Use proper capitalization and include network
-  // suffixes like "HD" or regional identifiers like "(Pacific)" where appropriate.
-  name: string;
+  // suffixes like "HD" or regional identifiers like "(Pacific)" where appropriate. Required for canonical channels; variants inherit from their canonical entry.
+  name?: string;
 
   // Profile name to use for this channel, overriding URL-based profile detection. Use this when a site's behavior doesn't match what would be inferred from its
   // domain, or when a specific channel needs different handling than others on the same site.
   profile?: string;
 
+  // Display name override for the provider selection dropdown. Normally auto-derived from the URL domain via DOMAIN_CONFIG in config/profiles.ts (e.g., a
+  // hulu.com URL automatically resolves to "Hulu"). Only needed when a channel's display name should differ from the domain-level default.
+  provider?: string;
+
   // Gracenote station ID for electronic program guide integration. When set, this ID is included in the M3U playlist as the tvc-guide-stationid attribute,
   // allowing Channels DVR to fetch program guide data for the channel.
   stationId?: string;
+
+  // EPG time shift in hours. When set, this value is included in the M3U playlist as the tvg-shift attribute, telling Channels DVR to offset the guide data by
+  // this many hours. Useful for time-delayed feeds that share a station ID with the primary feed (e.g., Pacific feeds that air 3 hours after the East feed).
+  tvgShift?: number;
 
   // URL of the streaming page to capture. This should be the direct URL to the live stream player, not a landing page or show page. Authentication cookies from
   // the Chrome profile are used, so the URL can be to authenticated content.
@@ -480,6 +535,9 @@ export interface Channel {
  * single source of truth for merged channel data across the codebase.
  */
 export interface ChannelListingEntry {
+
+  // Whether the channel has at least one provider variant available given the current provider filter. When false, the channel is hidden from the playlist and guide.
+  availableByProvider: boolean;
 
   // The channel definition with all properties (name, url, profile, etc.).
   channel: Channel;
@@ -495,15 +553,77 @@ export interface ChannelListingEntry {
 }
 
 /**
+ * A delta override for a predefined channel. All fields are optional because only fields that differ from the predefined definition are stored. String and number
+ * fields use Nullable<T> to distinguish "user cleared this field" (null) from "inherit from predefined" (absent). When a field is null, the predefined value is
+ * removed in the resolved channel. When a field is absent, the predefined value is inherited.
+ */
+export interface ChannelDelta {
+
+  // Override for channel number, or null to clear the predefined value.
+  channelNumber?: Nullable<number>;
+
+  // Override for channel selector, or null to clear the predefined value.
+  channelSelector?: Nullable<string>;
+
+  // Override for display name, or null to clear the predefined value.
+  name?: Nullable<string>;
+
+  // Override for profile, or null to clear the predefined value.
+  profile?: Nullable<string>;
+
+  // Override for station ID, or null to clear the predefined value.
+  stationId?: Nullable<string>;
+
+  // Override for EPG time shift, or null to clear the predefined value.
+  tvgShift?: Nullable<number>;
+
+  // Override for URL, or null to clear the predefined value. When absent, the predefined URL is inherited.
+  url?: Nullable<string>;
+}
+
+/**
+ * What gets stored in channels.json per key. For user-defined channels (no predefined equivalent), this is a full Channel with a required url. For overrides of
+ * predefined channels, this can be a ChannelDelta with only the differing fields. Legacy full-override entries (from before the delta model) are also valid — they
+ * are just deltas that happen to override every field.
+ */
+export type StoredChannel = Channel | ChannelDelta;
+
+/**
+ * Map of channel keys to stored channel data (full definitions or deltas). This is the raw type for the channels.json file contents.
+ */
+export type StoredChannelMap = Record<string, StoredChannel>;
+
+/**
  * Map of channel short names to channel definitions. Channel names must be URL-safe strings (lowercase letters, numbers, hyphens) since they appear in stream
  * request URLs.
  */
 export type ChannelMap = Record<string, Channel>;
 
-/*
- * STREAM TYPES
- *
- * These types track active streaming sessions throughout their lifecycle. When a stream request arrives, we create a StreamInfo object to track the session's
+/* Provider groups allow multiple streaming providers to offer the same content (e.g., ESPN via ESPN.com or Disney+). Channels are grouped by key prefix convention:
+ * a key like "espn-disneyplus" is a variant of "espn" because it starts with "espn-" and "espn" exists as a channel. The canonical key (the base key without
+ * suffix) is the default provider.
+ */
+
+/**
+ * Represents a group of provider variants for the same content. Used by the UI to display provider selection dropdowns for multi-provider channels.
+ */
+export interface ProviderGroup {
+
+  // The canonical channel key (without suffix), which is the default provider. Example: "espn" for the ESPN channel group.
+  canonicalKey: string;
+
+  // List of all provider variants including the canonical entry. Each variant has a key (channel key) and a display label for the UI.
+  variants: {
+
+    // Channel key for this provider variant. Example: "espn" or "espn-disneyplus".
+    key: string;
+
+    // UI display label derived from channel.provider (if set) or auto-resolved from the URL domain via getProviderDisplayName(). Example: "ESPN.com" or "Disney+".
+    label: string;
+  }[];
+}
+
+/* These types track active streaming sessions throughout their lifecycle. When a stream request arrives, we create a StreamInfo object to track the session's
  * state. This allows the /streams endpoint to list active streams, the graceful shutdown handler to close streams cleanly, and the stream handler to coordinate
  * cleanup when streams end.
  */
@@ -534,10 +654,7 @@ export interface StreamInfo {
   url: string;
 }
 
-/*
- * VIDEO STATE TYPES
- *
- * These types represent the state of HTML5 video elements as reported by the browser. The playback health monitor periodically evaluates video state to detect
+/* These types represent the state of HTML5 video elements as reported by the browser. The playback health monitor periodically evaluates video state to detect
  * problems and trigger recovery. Understanding these values is essential for diagnosing playback issues.
  */
 
@@ -583,10 +700,7 @@ export interface VideoState {
  */
 export type VideoSelectorType = "selectFirstVideo" | "selectReadyVideo";
 
-/*
- * URL VALIDATION TYPES
- *
- * Before navigating to user-provided URLs, we validate them to prevent security issues (like file:// access) and provide clear error messages for malformed URLs.
+/* Before navigating to user-provided URLs, we validate them to prevent security issues (like file:// access) and provide clear error messages for malformed URLs.
  * Validation runs before any browser interaction to fail fast with helpful feedback.
  */
 
@@ -607,10 +721,7 @@ export interface UrlValidationResult {
  */
 export type UrlValidation = UrlValidationResult;
 
-/*
- * HEALTH CHECK TYPES
- *
- * The /health endpoint returns detailed status information for monitoring and debugging. This includes browser connection state, memory usage, stream counts, and
+/* The /health endpoint returns detailed status information for monitoring and debugging. This includes browser connection state, memory usage, stream counts, and
  * configuration summary. External monitoring systems can poll this endpoint to detect problems.
  */
 
@@ -690,10 +801,7 @@ export interface HealthStatus {
   version: string;
 }
 
-/*
- * STREAM LIST TYPES
- *
- * The /streams endpoint returns information about all active streams, allowing operators to monitor what's currently streaming and terminate specific streams if
+/* The /streams endpoint returns information about all active streams, allowing operators to monitor what's currently streaming and terminate specific streams if
  * needed.
  */
 
@@ -733,10 +841,7 @@ export interface StreamListResponse {
   streams: StreamListItem[];
 }
 
-/*
- * CHANNEL SELECTION TYPES
- *
- * For multi-channel streaming sites (like USA Network), we need to interact with the site's channel selector UI to switch to the desired channel. The channel
+/* For multi-channel streaming sites (like USA Network), we need to interact with the site's channel selector UI to switch to the desired channel. The channel
  * selection system uses a strategy pattern to support different site implementations. Each strategy encapsulates the logic for finding and clicking the correct
  * channel element.
  */
@@ -744,19 +849,56 @@ export interface StreamListResponse {
 /**
  * Available channel selection strategies. Each strategy implements a different approach to finding and selecting channels in a multi-channel player UI.
  *
+ * - "foxGrid": Find channel by station code in a non-virtualized guide grid, click the channel logo button via DOM .click(). Used by Fox.com.
+ * - "guideGrid": Find channel by exact-matching image alt text, click nearest clickable ancestor. Optionally clicks a tab to reveal the list first. Used by Hulu
+ *   Live TV.
+ * - "hboGrid": Discover the HBO tab page URL from the homepage menu bar, scrape the live channel tile rail for a matching channel name, and navigate to the watch
+ *   URL. Caches the tab URL across tunes with stale-cache fallback. Used by HBO Max.
  * - "none": No channel selection needed (single-channel sites). This is the default.
- * - "thumbnailRow": Find channel by matching image URL slug, click adjacent element on the same row. Used by USA Network.
- * - "tileClick": Find channel tile by matching image URL slug, click tile, then click play button on modal. Used by Disney+ live channels.
+ * - "slingGrid": Find channel by data-testid in a virtualized A-Z guide grid, scroll via binary search on .guide-cell scrollTop, click the on-now program
+ *   cell. Used by Sling TV.
+ * - "thumbnailRow": Find channel element using the profile's matchSelector (defaults to image URL matching), click adjacent element on the same row. Used by
+ *   USA Network.
+ * - "tileClick": Find channel element using the profile's matchSelector (defaults to image URL matching), click tile, then optionally click play button if
+ *   playSelector is configured. Used by Disney+.
+ * - "youtubeGrid": Find channel by aria-label in a non-virtualized EPG grid, extract the watch URL, and navigate directly. Used by YouTube TV.
  */
-export type ChannelSelectionStrategy = "none" | "thumbnailRow" | "tileClick";
+export type ChannelSelectionStrategy = "foxGrid" | "guideGrid" | "hboGrid" | "none" | "slingGrid" | "thumbnailRow" | "tileClick" | "youtubeGrid";
 
 /**
  * Configuration for channel selection behavior within a site profile.
  */
 export interface ChannelSelectionConfig {
 
+  // CSS selector for a tab or button to click to reveal the channel list before selection. Some sites hide the channel list behind a tab (e.g., a "Channels" tab
+  // in a guide grid). When set, this element is clicked before searching for channel images. Only used by the guideGrid strategy.
+  listSelector?: string;
+
+  // CSS selector template for finding the channel element on the page. The placeholder {channel} is replaced with the channel's channelSelector value at runtime
+  // (e.g., "img[src*=\"{channel}\"]" becomes "img[src*=\"espn\"]"). Supports any valid CSS selector — match by image src, aria-label, data-testid, title, or any
+  // other attribute. Used by the tileClick and thumbnailRow strategies. When absent, these strategies default to image URL matching (img[src*="..."]).
+  matchSelector?: string;
+
+  // CSS selector for a play button that must be clicked after selecting a channel entry. Some sites show a playback action overlay after channel selection instead
+  // of immediately starting playback. When set, this element is waited for and clicked after the channel entry click. Used by the guideGrid and tileClick strategies.
+  playSelector?: string;
+
   // The strategy to use for finding and clicking channel elements.
   strategy: ChannelSelectionStrategy;
+}
+
+// Narrowed profile type for strategy functions. When selectChannel() validates that channelSelector is non-null, it narrows the profile to this type so
+// strategy functions receive a guaranteed non-null channelSelector without needing non-null assertions.
+export interface ChannelSelectionProfile extends ResolvedSiteProfile {
+
+  channelSelector: string;
+}
+
+// Type guard that proves channelSelector is a non-empty string. Matches the original !channelSelector truthiness check, which rejects both null and empty string.
+// Used by the coordinator before dispatching to strategy functions.
+export function isChannelSelectionProfile(profile: ResolvedSiteProfile): profile is ChannelSelectionProfile {
+
+  return (profile.channelSelector !== null) && (profile.channelSelector.length > 0);
 }
 
 /**
@@ -769,6 +911,102 @@ export interface ChannelSelectorResult {
 
   // Whether the channel was successfully selected.
   success: boolean;
+}
+
+/**
+ * The strategy function signature. All strategies take the Puppeteer page and a narrowed profile with guaranteed non-null channelSelector.
+ */
+export type ChannelStrategyHandler = (page: Page, profile: ChannelSelectionProfile) => Promise<ChannelSelectorResult>;
+
+/**
+ * The complete contract for a channel selection strategy. Each provider file exports a single object implementing this interface. The coordinator accesses all
+ * provider behavior through these hooks — no strategy-specific imports or hardcoded strategy name checks outside the registry.
+ */
+export interface ChannelStrategyEntry {
+
+  /**
+   * Resets all module-level caches (row positions, discovered URLs, watch URLs). Called on browser restart when cached state may be stale.
+   */
+  clearCache?: () => void;
+
+  /**
+   * Selects the target channel in the provider's guide UI. Receives a Puppeteer page and a profile with a guaranteed non-null channelSelector. Must handle its
+   * own retry logic (e.g., overlay dismiss) and return a result indicating success or failure with a diagnostic reason.
+   */
+  execute: ChannelStrategyHandler;
+
+  /**
+   * Removes a cached watch URL after it failed to produce a working stream. Called by the coordinator when a cached direct navigation fails.
+   */
+  invalidateDirectUrl?: (channelSelector: string) => void;
+
+  /**
+   * Returns a watch URL for direct navigation, bypassing guide page loading. Implementations may perform async work such as fetching current asset IDs from
+   * provider APIs. The page parameter allows setting up response interception or accessing browser context when needed (e.g., cold cache setup).
+   */
+  resolveDirectUrl?: (channelSelector: string, page: Page) => Promise<Nullable<string>>;
+}
+
+/**
+ * Standardized output shape for a channel discovered from a provider's guide. Produced by each provider's discoverChannels implementation and returned as
+ * a JSON array from the GET /providers/:slug/channels endpoint. Mirrors the shape of channel definitions in channels/index.ts so discovery output can be
+ * used directly to populate new entries.
+ */
+export interface DiscoveredChannel {
+
+  // Parent network name when the channel is a local affiliate. Present for Hulu affiliates, YTTV local affiliates, and Fox FOXD2C entries. Omitted when not
+  // applicable.
+  affiliate?: string;
+
+  // The value to use as channelSelector in channels/index.ts for tuning to this channel. Always present. For most channels this equals name. For Hulu affiliates
+  // this is the network name. For YTTV affiliates this is the network name. For Fox FOXD2C entries this is the internal call sign.
+  channelSelector: string;
+
+  // Human-readable display name as the provider shows it in their guide grid.
+  name: string;
+
+  // Channel tier: "paid" for subscription channels, "free" for free ad-supported channels. Present for Sling where the distinction matters (Freestream channels
+  // are free). Omitted for providers where all channels are paid.
+  tier?: string;
+}
+
+/**
+ * Unified provider contract that bundles identity metadata, tuning strategy, and channel discovery into a single registry entry. Each provider tuning file
+ * exports one ProviderModule. The coordinator builds its strategy dispatch lookup from provider modules at evaluation time. Generic strategies (thumbnailRow,
+ * tileClick) remain bare ChannelStrategyEntry objects — they are not providers.
+ */
+export interface ProviderModule {
+
+  /**
+   * Discovers all available channels from the provider's guide. The route handler navigates to guideUrl before calling this function unless handlesOwnNavigation
+   * is set. Returns a standardized DiscoveredChannel array.
+   */
+  discoverChannels: (page: Page) => Promise<DiscoveredChannel[]>;
+
+  /**
+   * Returns cached discovered channels if the provider has already fully enumerated its lineup from a previous tune or discovery call, or null if no enumeration
+   * has occurred. When non-null, the route handler can skip browser page creation entirely and return the cached result immediately.
+   */
+  getCachedChannels: () => Nullable<DiscoveredChannel[]>;
+
+  // The provider's live guide page URL. The route handler navigates here before calling discoverChannels (unless handlesOwnNavigation is set).
+  guideUrl: string;
+
+  // When true, the provider's discoverChannels function handles its own navigation instead of relying on the route to navigate to guideUrl first. Used by
+  // providers that need to set up response interception before navigation (e.g., Hulu, Sling).
+  handlesOwnNavigation?: boolean;
+
+  // Human-readable display name (e.g., "YouTube TV", "Hulu").
+  label: string;
+
+  // Provider identifier for API endpoints (e.g., "yttv", "hulu"). Used as the :slug parameter in GET /providers/:slug/channels.
+  slug: string;
+
+  // The existing tuning strategy contract, unchanged from the flat registry pattern.
+  strategy: ChannelStrategyEntry;
+
+  // Links back to the site profile strategy name for derived strategy lookup.
+  strategyName: ChannelSelectionStrategy;
 }
 
 /**
@@ -792,10 +1030,7 @@ export interface TuneResult {
   context: Frame | Page;
 }
 
-/*
- * CDP WINDOW TYPES
- *
- * Chrome DevTools Protocol operations for window management. We use CDP to resize and minimize browser windows to match viewport dimensions and reduce GPU usage
+/* Chrome DevTools Protocol operations for window management. We use CDP to resize and minimize browser windows to match viewport dimensions and reduce GPU usage
  * when the visual output isn't needed.
  */
 

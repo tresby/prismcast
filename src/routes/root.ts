@@ -7,21 +7,17 @@ import { checkForUpdates, escapeHtml, getChangelogItems, getPackageVersion, getV
 import { generateAdvancedTabContent, generateChannelsPanel, generateSettingsFormFooter, generateSettingsTabContent, hasEnvOverrides } from "./config.js";
 import { generateBaseStyles, generatePageWrapper, generateTabButton, generateTabPanel, generateTabScript, generateTabStyles } from "./ui.js";
 import { VIDEO_QUALITY_PRESETS } from "../config/presets.js";
-import { getAllChannels } from "../config/userChannels.js";
 import { getUITabs } from "../config/userConfig.js";
 import { resolveBaseUrl } from "./playlist.js";
-import { resolveProfile } from "../config/profiles.js";
 
-/*
- * LANDING PAGE
- *
- * The landing page provides operators with all the information they need to integrate with Channels DVR. It features a tabbed interface with five sections:
+/* The landing page provides operators with all the information they need to integrate with Channels DVR. It features a tabbed interface with six sections:
  *
  * 1. Overview - Introduction to PrismCast and Quick Start instructions
- * 2. Playlist - The full M3U playlist with copy functionality
+ * 2. Channels - The full M3U playlist with copy functionality
  * 3. Logs - Real-time log viewer for troubleshooting
  * 4. Configuration - Channel management and settings (with subtabs)
  * 5. API Reference - Documentation for all HTTP endpoints
+ * 6. Help - Updating, platform notes, troubleshooting, and known limitations
  */
 
 /**
@@ -33,7 +29,10 @@ function generateHeaderStatusHtml(): string {
   return [
     "<div id=\"system-status\" class=\"header-status\">",
     "<span id=\"system-health\"><span class=\"status-dot\" style=\"color: var(--text-muted);\">&#9679;</span> Connecting...</span>",
-    "<span id=\"stream-count\">-</span>",
+    "<div class=\"dropdown stream-popover\">",
+    "<button type=\"button\" id=\"stream-count\" aria-label=\"Active streams\" onclick=\"toggleStreamPopover()\">-</button>",
+    "<div class=\"dropdown-menu\" id=\"stream-popover-menu\"></div>",
+    "</div>",
     "</div>"
   ].join("\n");
 }
@@ -49,7 +48,7 @@ function generateVersionHtml(): string {
 
   // Refresh icon for manual update check (using Unicode refresh symbol).
   const refreshIcon = [
-    "<button type=\"button\" class=\"version-check\" onclick=\"checkForUpdates()\" title=\"Check for updates\">",
+    "<button type=\"button\" class=\"version-check\" onclick=\"checkForUpdates()\" title=\"Check for updates\" aria-label=\"Check for updates\">",
     "&#8635;",
     "</button>"
   ].join("");
@@ -90,6 +89,7 @@ function generateChangelogModal(): string {
     "<div class=\"changelog-content\" style=\"display: none;\"></div>",
     "<p class=\"changelog-error\" style=\"display: none;\">Unable to load changelog.</p>",
     "<div class=\"changelog-modal-buttons\">",
+    "<button type=\"button\" id=\"changelog-upgrade-btn\" class=\"btn btn-success\" style=\"display: none;\" onclick=\"startUpgrade()\">Upgrade</button>",
     "<a href=\"https://github.com/hjdhjd/prismcast/releases\" target=\"_blank\" rel=\"noopener\" class=\"btn btn-primary\">View on GitHub</a>",
     "<button type=\"button\" class=\"btn btn-secondary\" onclick=\"closeChangelogModal()\">Close</button>",
     "</div>",
@@ -127,6 +127,8 @@ function generateStatusScript(): string {
     "var streamData = {};",
     "var systemData = null;",
     "var expandedStreams = {};",
+    "var healthColorVars = { healthy: 'var(--stream-healthy)', buffering: 'var(--stream-buffering)', recovering: 'var(--stream-recovering)', ",
+    "  stalled: 'var(--stream-stalled)', error: 'var(--stream-error)' };",
 
     // Format duration in human readable format.
     "function formatDuration(seconds) {",
@@ -162,13 +164,25 @@ function generateStatusScript(): string {
     "  return timeStr;",
     "}",
 
-    // Extract domain from URL for display.
+    // Extract concise domain from URL for display (last two hostname parts). Mirrors the server-side extractDomain() in utils/format.ts.
     "function getDomain(url) {",
     "  try {",
-    "    return new URL(url).hostname;",
+    "    var parts = new URL(url).hostname.split('.');",
+    "    return parts.length > 2 ? parts.slice(-2).join('.') : parts.join('.');",
     "  } catch (e) {",
     "    return url;",
     "  }",
+    "}",
+
+    // Build channel display HTML with an optional logo image. When a logo URL is available, renders an img element with an onerror fallback that hides the
+    // image and reveals a text span. The logoClass and textClass parameters allow callers to apply context-specific sizing.
+    "function channelDisplayHtml(logoUrl, name, logoClass, textClass) {",
+    "  if(logoUrl) {",
+    "    return '<img src=\"' + logoUrl + '\" class=\"' + logoClass + '\" alt=\"' + name + '\" title=\"' + name + '\" ' +",
+    "      'onerror=\"this.style.display=\\'none\\';this.nextElementSibling.style.display=\\'inline\\'\">' +",
+    "      '<span class=\"' + textClass + '\" style=\"display:none\">' + name + '</span>';",
+    "  }",
+    "  return '<span class=\"' + textClass + '\">' + name + '</span>';",
     "}",
 
     // Get row background color based on health status. Uses CSS variables for theme support.
@@ -186,8 +200,6 @@ function generateStatusScript(): string {
     // Get health badge HTML using CSS variables for theme-aware colors. NOTE: Escalation level semantics defined in monitor.ts.
     // L1=play/unmute, L2=seek, L3=source reload, L4=page navigation.
     "function getHealthBadge(health, level) {",
-    "  var colorVars = { healthy: 'var(--stream-healthy)', buffering: 'var(--stream-buffering)', recovering: 'var(--stream-recovering)', ",
-    "    stalled: 'var(--stream-stalled)', error: 'var(--stream-error)' };",
     "  var label = '';",
     "  if (health === 'healthy') { label = 'Healthy'; }",
     "  else if (health === 'buffering') { label = 'Buffering'; }",
@@ -201,7 +213,7 @@ function generateStatusScript(): string {
     "    else { label = 'Recovering'; }",
     "  }",
     "  else { label = health; }",
-    "  return '<span class=\"status-dot\" style=\"color: ' + (colorVars[health] || 'var(--text-muted)') + ';\">&#9679;</span> ' +",
+    "  return '<span class=\"status-dot\" style=\"color: ' + (healthColorVars[health] || 'var(--text-muted)') + ';\">&#9679;</span> ' +",
     "    '<span style=\"color: var(--text-secondary);\">' + label + '</span>';",
     "}",
 
@@ -219,10 +231,60 @@ function generateStatusScript(): string {
     "  var limit = systemData.streams.limit;",
     "  if(active === 0) {",
     "    streamEl.textContent = '0 streams';",
+    "    streamEl.classList.remove('clickable');",
+    "    var popMenu = document.getElementById('stream-popover-menu');",
+    "    if(popMenu) popMenu.classList.remove('show');",
     "  } else {",
     "    streamEl.textContent = active + '/' + limit + ' streams';",
+    "    streamEl.classList.add('clickable');",
     "  }",
     "}",
+
+    // Build the popover content from streamData. Populates the given menu element with one row per active stream.
+    "function buildStreamPopoverContent(menu) {",
+    "  var ids = Object.keys(streamData);",
+    "  var html = '';",
+    "  var now = Date.now();",
+    "  for(var i = 0; i < ids.length; i++) {",
+    "    var s = streamData[ids[i]];",
+    "    var color = healthColorVars[s.health] || 'var(--text-muted)';",
+    "    var name = s.channel || s.providerName || getDomain(s.url);",
+    "    var dur = Math.floor((now - new Date(s.startTime).getTime()) / 1000);",
+    "    var titleAttr = s.showName ? ' title=\"' + s.showName + '\"' : '';",
+    "    html += '<div class=\"stream-popover-row\"' + titleAttr + '>';",
+    "    html += '<span class=\"status-dot\" style=\"color: ' + color + ';\">&#9679;</span>';",
+    "    html += channelDisplayHtml(s.logoUrl, name, 'stream-popover-logo', 'stream-popover-channel');",
+    "    html += '<span class=\"stream-popover-duration\">' + formatDuration(dur) + '</span>';",
+    "    html += '</div>';",
+    "  }",
+    "  menu.innerHTML = html;",
+    "}",
+
+    // Update an already-open stream popover with current data. Called from SSE handlers and the duration interval.
+    "function updateStreamPopover() {",
+    "  var menu = document.getElementById('stream-popover-menu');",
+    "  if(!menu || !menu.classList.contains('show')) return;",
+    "  var ids = Object.keys(streamData);",
+    "  if(ids.length === 0) {",
+    "    menu.classList.remove('show');",
+    "    return;",
+    "  }",
+    "  buildStreamPopoverContent(menu);",
+    "}",
+
+    // Toggle the stream popover open or closed.
+    "window.toggleStreamPopover = function() {",
+    "  var ids = Object.keys(streamData);",
+    "  if(ids.length === 0) return;",
+    "  var menu = document.getElementById('stream-popover-menu');",
+    "  if(!menu) return;",
+    "  var isOpen = menu.classList.contains('show');",
+    "  closeDropdowns();",
+    "  if(!isOpen) {",
+    "    buildStreamPopoverContent(menu);",
+    "    menu.classList.add('show');",
+    "  }",
+    "};",
 
     // Format last issue for display.
     "function formatLastIssue(s) {",
@@ -271,12 +333,8 @@ function generateStatusScript(): string {
     "    var isExpanded = expandedStreams[id];",
     "    var chevron = isExpanded ? '&#9660;' : '&#9654;';",
     "    var rowTint = getRowTint(s.health);",
-    "    var channelText = s.channel || getDomain(s.url);",
-    "    var channelDisplay = s.logoUrl",
-    "      ? '<img src=\"' + s.logoUrl + '\" class=\"channel-logo\" alt=\"' + channelText + '\" title=\"' + channelText + '\" ' +",
-    "        'onerror=\"this.style.display=\\'none\\';this.nextElementSibling.style.display=\\'inline\\'\">' +",
-    "        '<span class=\"channel-text\" style=\"display:none\">' + channelText + '</span>'",
-    "      : '<span class=\"channel-text\">' + channelText + '</span>';",
+    "    var channelText = s.channel || s.providerName || getDomain(s.url);",
+    "    var channelDisplay = channelDisplayHtml(s.logoUrl, channelText, 'channel-logo', 'channel-text');",
     "    html += '<tr class=\"stream-row\" data-id=\"' + id + '\" onclick=\"toggleStreamDetails(' + id + ')\" style=\"background-color: ' + rowTint + ';\">';",
     "    html += '<td class=\"chevron\">' + chevron + '</td>';",
     "    var durationSpan = '<span class=\"stream-duration\" id=\"duration-' + id + '\">\\u00b7 ' + formatDuration(s.duration) + '</span>';",
@@ -329,12 +387,30 @@ function generateStatusScript(): string {
     "    var el = document.getElementById('duration-' + id);",
     "    if (el) el.textContent = '\\u00b7 ' + formatDuration(durationSec);",
     "  }",
+    "  updateStreamPopover();",
     "}",
 
-    // Connect to SSE stream for status updates.
-    "(function() {",
+    // Track the last time any SSE event was received from the status stream. Used by the staleness checker to detect silently dead connections.
+    "var lastStatusEventTime = Date.now();",
+    "var hiddenSince = 0;",
+
+    // Connect (or reconnect) to the status SSE stream. Closes any existing connection first so this is safe to call repeatedly.
+    "function connectStatusSSE() {",
+    "  if(statusEventSource) { statusEventSource.close(); }",
     "  statusEventSource = new EventSource('/streams/status');",
-    "  statusEventSource.addEventListener('snapshot', function(e) {",
+    "  lastStatusEventTime = Date.now();",
+
+    // Local helper that registers an event listener and updates the staleness timestamp on every event. Handlers are optional so heartbeat can
+    // be registered with just on('heartbeat') for pure keepalive tracking. The onerror handler stays outside this wrapper because errors must
+    // not reset the staleness timer — a connection that only fires errors is still dead.
+    "  function on(event, handler) {",
+    "    statusEventSource.addEventListener(event, function(e) {",
+    "      lastStatusEventTime = Date.now();",
+    "      if(handler) { handler(e); }",
+    "    });",
+    "  }",
+    "  on('heartbeat');",
+    "  on('snapshot', function(e) {",
     "    var data = JSON.parse(e.data);",
     "    systemData = data.system;",
     "    streamData = {};",
@@ -343,51 +419,108 @@ function generateStatusScript(): string {
     "    }",
     "    updateSystemStatus();",
     "    renderStreamsTable();",
+    "    updateStreamPopover();",
     "  });",
-    "  statusEventSource.addEventListener('streamAdded', function(e) {",
+    "  on('streamAdded', function(e) {",
     "    var s = JSON.parse(e.data);",
     "    streamData[s.id] = s;",
     "    renderStreamsTable();",
+    "    updateStreamPopover();",
     "  });",
-    "  statusEventSource.addEventListener('streamRemoved', function(e) {",
+    "  on('streamRemoved', function(e) {",
     "    var data = JSON.parse(e.data);",
     "    delete streamData[data.id];",
     "    delete expandedStreams[data.id];",
     "    renderStreamsTable();",
+    "    updateStreamPopover();",
     "    if (typeof pendingRestart !== 'undefined' && pendingRestart) {",
     "      updateRestartDialogStatus();",
     "    }",
     "  });",
-    "  statusEventSource.addEventListener('streamHealthChanged', function(e) {",
+    "  on('streamHealthChanged', function(e) {",
     "    var s = JSON.parse(e.data);",
     "    if (streamData[s.id]) {",
     "      streamData[s.id] = s;",
     "      renderStreamsTable();",
+    "      updateStreamPopover();",
     "    }",
     "  });",
-    "  statusEventSource.addEventListener('systemStatusChanged', function(e) {",
+    "  on('systemStatusChanged', function(e) {",
     "    systemData = JSON.parse(e.data);",
     "    updateSystemStatus();",
     "  });",
     "  statusEventSource.onerror = function() {",
     "    document.getElementById('system-health').innerHTML = '<span class=\"status-dot\" style=\"color: var(--stream-stalled);\">&#9679;</span> Updates paused';",
     "  };",
-    "  setInterval(updateDurations, 1000);",
+    "}",
+
+    // Initial connection and periodic timers.
+    "connectStatusSSE();",
+    "setInterval(updateDurations, 1000);",
+
+    // Staleness detection: if no SSE event has arrived in 45 seconds, the connection is likely dead. Reconnect proactively.
+    "setInterval(function() {",
+    "  if((Date.now() - lastStatusEventTime) > 45000) { connectStatusSSE(); }",
+    "}, 45000);",
+
+    // Visibility-driven reconnect. When the page returns from being hidden for more than 30 seconds, reconnect the status stream and re-activate
+    // the current tab so the logs stream reconnects naturally through its existing tabactivated listener.
+    "document.addEventListener('visibilitychange', function() {",
+    "  if(document.hidden) {",
+    "    hiddenSince = Date.now();",
+    "  } else if((hiddenSince > 0) && ((Date.now() - hiddenSince) > 30000)) {",
+    "    hiddenSince = 0;",
+    "    connectStatusSSE();",
+    "    var activeTab = document.querySelector('.tab-btn.active');",
+    "    if(activeTab) {",
+    "      document.dispatchEvent(new CustomEvent('tabactivated', { detail: { category: activeTab.getAttribute('data-category') } }));",
+    "    }",
+    "  } else {",
+    "    hiddenSince = 0;",
+    "  }",
+    "});",
 
     // Copy playlist URL function for Overview tab Quick Start section.
-    "  window.copyOverviewPlaylistUrl = function() {",
-    "    var urlEl = document.getElementById('overview-playlist-url');",
-    "    if (urlEl) {",
-    "      navigator.clipboard.writeText(urlEl.textContent).then(function() {",
-    "        var feedback = document.getElementById('overview-copy-feedback');",
-    "        if (feedback) {",
-    "          feedback.style.display = 'inline';",
-    "          setTimeout(function() { feedback.style.display = 'none'; }, 2000);",
-    "        }",
-    "      });",
-    "    }",
-    "  };",
+    "window.copyOverviewPlaylistUrl = function() {",
+    "  var urlEl = document.getElementById('overview-playlist-url');",
+    "  if (urlEl) {",
+    "    navigator.clipboard.writeText(urlEl.textContent).then(function() {",
+    "      var feedback = document.getElementById('overview-copy-feedback');",
+    "      if (feedback) {",
+    "        feedback.style.display = 'inline';",
+    "        setTimeout(function() { feedback.style.display = 'none'; }, 2000);",
+    "      }",
+    "    });",
+    "  }",
+    "};",
 
+    // JS-based tooltips for devices where the primary input can't hover (iPadOS). Safari on iPadOS doesn't show native title tooltips, so we use
+    // a single <div> appended to <body> and positioned via getBoundingClientRect(). This is immune to overflow containers and stacking contexts.
+    // On pure-touch devices without a trackpad, mouseenter never fires so the tooltip stays hidden. Desktop skips initialization entirely.
+    "(function() {",
+    "  if(!window.matchMedia('(hover: none)').matches) return;",
+    "  var tip = document.createElement('div');",
+    "  tip.className = 'btn-icon-tooltip';",
+    "  document.body.appendChild(tip);",
+    "  document.addEventListener('mouseenter', function(e) {",
+    "    var btn = e.target.closest('.btn-icon[aria-label]');",
+    "    if(!btn) return;",
+    "    var label = btn.getAttribute('aria-label');",
+    "    if(!label) return;",
+    "    var rect = btn.getBoundingClientRect();",
+    "    tip.textContent = label;",
+    "    tip.classList.add('visible');",
+    "    tip.style.top = (rect.bottom + 6) + 'px';",
+    "    tip.style.left = (rect.left + rect.width / 2) + 'px';",
+    "    tip.style.transform = 'translateX(-50%)';",
+    "  }, true);",
+    "  document.addEventListener('mouseleave', function(e) {",
+    "    var src = e.target.closest('.btn-icon[aria-label]');",
+    "    if(!src) return;",
+    "    var dest = e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest('.btn-icon[aria-label]');",
+    "    if(dest === src) return;",
+    "    tip.classList.remove('visible');",
+    "  }, true);",
     "})();",
 
     "</script>"
@@ -395,26 +528,50 @@ function generateStatusScript(): string {
 }
 
 /**
- * Generates the Overview tab content with introduction and quick start instructions.
+ * Generates the Overview tab content with a comprehensive user guide covering what PrismCast is, video quality expectations, quick start instructions, tuning speed,
+ * channel authentication, working with channels, and system requirements.
  * @param baseUrl - The base URL for the server.
- * @param videoChannelCount - The number of video channels available.
  * @returns HTML content for the Overview tab.
  */
-function generateOverviewContent(baseUrl: string, videoChannelCount: number): string {
+function generateOverviewContent(baseUrl: string): string {
 
   return [
+
     // Active streams table at the top.
     generateActiveStreamsSection(),
 
+    // What Is PrismCast?
     "<div class=\"section\">",
-    "<p>PrismCast is a streaming server that captures live video from web-based TV players and re-streams them over HTTP. ",
-    "It uses a headless Chrome browser to navigate to television network streaming sites, captures the video and audio output, and pipes it to HTTP clients. ",
-    "This allows Channels DVR and similar applications to record and watch content from streaming sites that do not offer direct video URLs.</p>",
+    "<h3>What Is PrismCast?</h3>",
+    "<p>PrismCast captures live video from web-based TV players by driving a real Chrome browser. It navigates to streaming sites, captures the ",
+    "screen and audio output, and serves the result as HLS streams over HTTP. Think of it as a <strong>virtual TV tuner for web-based content</strong> &mdash; ",
+    "it lets Channels DVR (and other applications) record and watch content from streaming sites that do not offer direct video URLs.</p>",
+    "<p>PrismCast is built around three priorities, in order:</p>",
+    "<ol>",
+    "<li><strong>Reliability</strong> &mdash; tuning a channel always delivers that channel. When the primary approach fails, fallback strategies ",
+    "ensure the tune still succeeds.</li>",
+    "<li><strong>Health monitoring</strong> &mdash; once a channel is playing, PrismCast continuously monitors the stream and takes corrective ",
+    "action automatically if issues arise.</li>",
+    "<li><strong>Speed</strong> &mdash; tuning and recovery should be as fast as possible, but never at the expense of reliability.</li>",
+    "</ol>",
+    "<p>The ordering is intentional. PrismCast will always choose the reliable path over the fast one.</p>",
     "</div>",
 
+    // Video Quality.
+    "<div class=\"section\">",
+    "<h3>Video Quality</h3>",
+    "<p><strong>PrismCast delivers H.264 video with AAC stereo audio</strong> at configurable quality presets ranging from 480p to 1080p. ",
+    "Quality presets can be changed in the <a href=\"#config/settings\">Configuration</a> tab.</p>",
+    "<p>This is <em>not</em> a replacement for native 4K, HDR, Dolby Vision, or surround sound &mdash; it is screen capture, not a direct feed. ",
+    "PrismCast captures directly from Chrome's media pipeline with <strong>no video transcoding</strong>, which is why tuning is fast and CPU usage ",
+    "stays low. The result is good quality video that works well for everyday viewing and DVR recording. PrismCast is designed for content you ",
+    "<strong>cannot get any other way</strong> in Channels DVR: network streaming sites, free ad-supported TV, and live channels that only exist on the web.</p>",
+    "</div>",
+
+    // Quick Start (Channels DVR).
     "<div class=\"section\">",
     "<h3>Quick Start</h3>",
-    "<p>To add these channels to Channels DVR:</p>",
+    "<p>To add PrismCast channels to Channels DVR:</p>",
     "<ol>",
     "<li>Go to <strong>Settings &rarr; Custom Channels</strong> in your Channels DVR server.</li>",
     "<li>Click <strong>Add Source</strong> and select <strong>M3U Playlist</strong>.</li>",
@@ -422,11 +579,14 @@ function generateOverviewContent(baseUrl: string, videoChannelCount: number): st
     "<button class=\"btn-copy-inline\" onclick=\"copyOverviewPlaylistUrl()\" title=\"Copy URL\">Copy</button>",
     "<span id=\"overview-copy-feedback\" class=\"copy-feedback-inline\">Copied!</span></li>",
     "<li>Set <strong>Stream Format</strong> to <strong>HLS</strong>.</li>",
-    "<li>The " + String(videoChannelCount) + " configured channels will be imported automatically.</li>",
+    "<li>Optionally, go to the <a href=\"#channels\">Channels tab</a> and set the <strong>provider filter</strong> to only include streaming services you ",
+    "subscribe to. This controls which channels Channels DVR sees in the playlist.</li>",
+    "<li>Your configured channels will be imported automatically.</li>",
     "</ol>",
-    "<p>Individual channels can be streamed directly using HLS URLs like <code>" + baseUrl + "/hls/nbc/stream.m3u8</code>.</p>",
+    "<p>Individual channels can also be streamed directly using HLS URLs like <code>" + baseUrl + "/hls/nbc/stream.m3u8</code>.</p>",
     "</div>",
 
+    // Plex Integration.
     "<div class=\"section\">",
     "<h3>Plex Integration</h3>",
     "<p>PrismCast includes built-in HDHomeRun emulation, allowing Plex to use it as a network tuner for live TV and DVR recording.</p>",
@@ -436,9 +596,35 @@ function generateOverviewContent(baseUrl: string, videoChannelCount: number): st
     "<li>Plex will detect PrismCast as an HDHomeRun tuner and import available channels.</li>",
     "</ol>",
     "<p>HDHomeRun emulation is enabled by default and can be configured in the ",
-    "<a href=\"#config/hdhr\">HDHomeRun / Plex</a> configuration tab.</p>",
+    "<a href=\"#config/settings\">HDHomeRun / Plex</a> configuration tab.</p>",
     "</div>",
 
+    // Tuning Speed.
+    "<div class=\"section\">",
+    "<h3>Tuning Speed</h3>",
+    "<p>When a client requests a channel, PrismCast navigates Chrome to the streaming site, locates the video player, starts capture, and serves the ",
+    "first HLS segment. How long this takes depends on the channel type:</p>",
+
+    "<h4>Direct URL Channels (~3&ndash;5 seconds)</h4>",
+    "<p>Sites where PrismCast navigates directly to a player page and video starts automatically. ",
+    "Examples: NBC, ABC, Paramount+, USA Network.</p>",
+
+    "<h4>Guide-Based Providers &mdash; First Tune (~5&ndash;10 seconds)</h4>",
+    "<p>Sites where PrismCast navigates a live TV guide to find and select the channel. The first tune for a given channel is slower because the ",
+    "guide grid must be searched. Examples: HBO Max, Hulu, Sling TV, YouTube TV, Fox.</p>",
+
+    "<h4>Guide-Based Providers &mdash; Subsequent Tunes (~3&ndash;5 seconds)</h4>",
+    "<p>After the first tune, PrismCast caches channel data for <strong>HBO Max, Hulu, Sling TV, and YouTube TV</strong>. ",
+    "Subsequent tunes skip guide navigation entirely and are comparable to direct URL channels. If cached data ",
+    "becomes stale, PrismCast falls back to guide navigation transparently.</p>",
+
+    "<h4>Idle Window</h4>",
+    "<p>Streams stay alive for <strong>30 seconds</strong> after the last client disconnects (configurable in the ",
+    "<a href=\"#config/settings\">Configuration</a> tab). This means channel surfing in Channels DVR is instant for recently-viewed channels &mdash; ",
+    "no re-tuning is needed. Combined with channel caching, the system gets faster the more you use it.</p>",
+    "</div>",
+
+    // Channel Authentication.
     "<div class=\"section\">",
     "<h3>Channel Authentication</h3>",
     "<p>Many streaming channels require TV provider authentication before content can be accessed. To authenticate:</p>",
@@ -449,25 +635,161 @@ function generateOverviewContent(baseUrl: string, videoChannelCount: number): st
     "<li>Complete the TV provider sign-in process in the browser.</li>",
     "<li>Click <strong>Done</strong> when authentication is complete.</li>",
     "</ol>",
-    "<p>Your login credentials are saved in the browser profile and persist across restarts. You only need to authenticate once per TV provider.</p>",
+    "<p>Your login credentials are saved in the browser profile and persist across restarts. You only need to authenticate once per TV provider. ",
+    "The Login button is stateless and always displays &ldquo;Login&rdquo; regardless of authentication status &mdash; successful authentication is ",
+    "confirmed when the channel streams correctly. Some TV providers periodically expire sessions on their end, requiring re-authentication. This is ",
+    "a provider limitation, not a PrismCast issue &mdash; simply click Login again to re-authenticate.</p>",
+    "<p class=\"description-hint\">If PrismCast is running headless or on a remote server, use a VNC client to access the browser for authentication.</p>",
     "</div>",
 
+    // Working with Channels.
     "<div class=\"section\">",
-    "<h3>Configuration</h3>",
-    "<p>Use the <a href=\"#config\">Configuration tab</a> to:</p>",
-    "<ul>",
-    "<li>Add, edit, or remove custom channels.</li>",
-    "<li>Adjust server, browser, and streaming settings.</li>",
-    "<li>View environment variable overrides.</li>",
-    "</ul>",
+    "<h3>Working with Channels</h3>",
+
+    "<h4>Predefined Channels</h4>",
+    "<p>PrismCast ships with channels across multiple streaming providers, maintained and updated with each release. You can disable any channels ",
+    "you do not need from the <a href=\"#channels\">Channels tab</a>. The predefined set covers common networks and is a good starting point &mdash; ",
+    "enable what you watch and disable the rest. You can also override any predefined channel with your own custom definition ",
+    "(see <em>Overriding Predefined Channels</em> below).</p>",
+
+    "<h4>Provider Variants</h4>",
+    "<p>Some channels (Comedy Central, Fox, NBC, etc.) are available from multiple streaming providers. The <strong>provider dropdown</strong> on each ",
+    "channel lets you choose which service to use for that channel. Different providers may offer different tuning performance.</p>",
+
+    "<h4>Provider Filter</h4>",
+    "<p>If you only subscribe to certain streaming services, use the <strong>provider filter</strong> on the ",
+    "<a href=\"#channels\">Channels tab</a> toolbar to show only relevant channels. This filter also controls which channels appear in the playlist ",
+    "that Channels DVR imports &mdash; set it before adding the playlist source in the <a href=\"#overview\">Quick Start</a>. You can also filter ",
+    "programmatically using the <code>?provider=</code> query parameter on the playlist URL.</p>",
+
+    "<h4>Bulk Operations</h4>",
+    "<p>The <strong>Set all channels to</strong> dropdown on the <a href=\"#channels\">Channels tab</a> toolbar switches every multi-provider channel ",
+    "to a single provider at once. This is useful when you want all channels routed through one streaming service. The operation can be undone by ",
+    "switching individual channels back or selecting a different provider from the same dropdown.</p>",
+
+    "<h4>User-Defined Channels</h4>",
+    "<p>You can add custom channels for any streaming site. Provide a URL, select a site profile, and PrismCast will capture it. For sites with ",
+    "multiple live channels (like a live TV provider), the <strong>Channel Selector</strong> field tells PrismCast which channel to tune to &mdash; ",
+    "the expected value depends on the provider. When adding or editing a channel, select a profile to see the <strong>Profile Reference</strong> ",
+    "section with site-specific guidance, including expected channel selector formats for known providers.</p>",
+
+    "<h4>Overriding Predefined Channels</h4>",
+    "<p>To override a predefined channel, create a user-defined channel with the same channel key. Both versions will appear in the provider ",
+    "dropdown &mdash; yours labeled <em>Custom</em> and the original with its provider name. You can switch between them at any time.</p>",
+    "<p class=\"description-hint\">For automation and integration with other workflows, see the <a href=\"#api\">API Reference</a> tab for the full HTTP API.</p>",
     "</div>",
 
+    // Requirements.
     "<div class=\"section\">",
     "<h3>Requirements</h3>",
     "<ul>",
     "<li>Google Chrome browser installed.</li>",
     "<li>Sufficient memory for browser automation (2GB+ recommended).</li>",
     "<li>Network access to streaming sites.</li>",
+    "</ul>",
+    "<p class=\"description-hint\">See the <a href=\"#help\">Help</a> tab for platform-specific requirements and troubleshooting.</p>",
+    "</div>"
+  ].join("\n");
+}
+
+/**
+ * Generates the Help tab content with updating instructions, platform notes, troubleshooting, and known limitations.
+ * @returns HTML content for the Help tab.
+ */
+function generateHelpContent(): string {
+
+  return [
+
+    // Updating PrismCast.
+    "<div class=\"section\">",
+    "<h3>Updating PrismCast</h3>",
+    "<p>Settings and channel configurations are preserved across updates.</p>",
+    "<h4>Homebrew (macOS)</h4>",
+    "<pre>brew upgrade prismcast\nprismcast service restart</pre>",
+    "<h4>npm</h4>",
+    "<pre>npm install -g prismcast\nprismcast service restart</pre>",
+    "<h4>Docker</h4>",
+    "<p>Pull the latest image and recreate the container. If using Watchtower, updates are applied automatically.</p>",
+    "<pre>docker pull ghcr.io/hjdhjd/prismcast:latest\ndocker compose up -d</pre>",
+    "</div>",
+
+    // Display and Resolution.
+    "<div class=\"section\">",
+    "<h3>Display and Resolution</h3>",
+    "<p>PrismCast captures video from Chrome's display output. The <strong>capture resolution must be smaller than the physical display resolution</strong> ",
+    "because browser toolbars and window chrome consume approximately 100&ndash;150 vertical pixels. For example, to capture at 1080p (1920&times;1080), the ",
+    "display must be larger than 1080p.</p>",
+    "<p>When the selected quality preset exceeds what the display can provide, PrismCast logs a warning and automatically degrades to the best available preset. ",
+    "This is not an error &mdash; PrismCast is adapting to your display.</p>",
+    "<h4>Headless Servers</h4>",
+    "<p>macOS works without a physical monitor. Windows and Linux servers without a display need an <strong>HDMI dummy plug</strong> or a ",
+    "<strong>virtual display adapter</strong> to provide a display resolution for Chrome to render into.</p>",
+    "<h4>Remote Access</h4>",
+    "<p>macOS Screen Sharing and VNC work correctly. <strong>Windows Remote Desktop (RDP) does not work</strong> &mdash; RDP creates a virtual display ",
+    "with different properties that interfere with Chrome's rendering. Use VNC or connect a physical display on Windows.</p>",
+    "</div>",
+
+    // Platform Notes.
+    "<div class=\"section\">",
+    "<h3>Platform Notes</h3>",
+    "<h4>macOS</h4>",
+    "<p>Chrome on macOS uses GPU hardware acceleration for video encoding, providing the best capture performance. After installing Node.js, go to ",
+    "<strong>System Settings &rarr; Privacy &amp; Security &rarr; App Management</strong> and allow Node.js. Use Screen Sharing or VNC for remote access ",
+    "to the PrismCast machine.</p>",
+    "<h4>Windows</h4>",
+    "<p>Install PrismCast as a service with <code>prismcast service install</code>. See Remote Access above for display capture requirements.</p>",
+    "<h4>Linux / Docker</h4>",
+    "<p>Chrome cannot use GPU hardware acceleration with virtual displays on Linux (a Chrome limitation), so Docker containers rely on software ",
+    "rendering. Access the browser via VNC for authentication &mdash; Docker containers expose noVNC at port 6080.</p>",
+    "</div>",
+
+    // Troubleshooting.
+    "<div class=\"section\">",
+    "<h3>Troubleshooting</h3>",
+    "<table>",
+    "<tr><th>Problem</th><th>Cause</th><th>Solution</th></tr>",
+    "<tr>",
+    "<td>\"Browser Offline\" or \"Browser is not connected\"</td>",
+    "<td>An existing Chrome process is running.</td>",
+    "<td>Quit all Chrome instances, then restart PrismCast.</td>",
+    "</tr>",
+    "<tr>",
+    "<td>\"All tuners in use\" despite no active streams</td>",
+    "<td>Stale stream state.</td>",
+    "<td>Restart PrismCast service.</td>",
+    "</tr>",
+    "<tr>",
+    "<td>Chrome won't open for login</td>",
+    "<td>Running headless or as a service.</td>",
+    "<td>Access the PrismCast machine via VNC or Screen Sharing to complete authentication.</td>",
+    "</tr>",
+    "<tr>",
+    "<td>macOS blocks Node.js after install</td>",
+    "<td>App Management security gate.</td>",
+    "<td>System Settings &rarr; Privacy &amp; Security &rarr; App Management &rarr; Allow Node.js.</td>",
+    "</tr>",
+    "<tr>",
+    "<td>Port conflict (address in use)</td>",
+    "<td>Another service using port 5589.</td>",
+    "<td>Stop the conflicting service, or change the port in <a href=\"#config/settings\">Configuration</a>.</td>",
+    "</tr>",
+    "</table>",
+    "</div>",
+
+    // Known Limitations.
+    "<div class=\"section\">",
+    "<h3>Known Limitations</h3>",
+    "<ul>",
+    "<li><strong>Bitrate is approximate.</strong> Chrome's media encoder treats the configured bitrate as a target, not a hard limit. ",
+    "Actual bitrate may vary based on content complexity.</li>",
+    "<li><strong>Frame rate follows the source.</strong> If the streaming site delivers 30fps, capture will be 30fps regardless of the configured ",
+    "frame rate setting.</li>",
+    "<li><strong>No closed captions.</strong> Chrome's capture API does not include caption data. Subtitles are not available in PrismCast streams.</li>",
+    "<li><strong>No 4K, HDR, or surround sound.</strong> PrismCast captures H.264 video with AAC stereo audio. It is not a replacement for native ",
+    "4K, HDR, Dolby Vision, or Dolby Atmos content.</li>",
+    "<li><strong>Capture resolution is limited by display size.</strong> See the Display and Resolution section above for details.</li>",
+    "<li><strong>Chrome may drop frames after extended use.</strong> The Chrome encoder can degrade after many hours of continuous operation. PrismCast ",
+    "automatically restarts Chrome during idle periods to mitigate this.</li>",
     "</ul>",
     "</div>"
   ].join("\n");
@@ -482,11 +804,75 @@ function generateApiReferenceContent(): string {
   return [
     "<div class=\"section\">",
     "<p>PrismCast provides a RESTful HTTP API for streaming, management, and diagnostics.</p>",
+    "<div class=\"api-index\">",
+
+    "<div class=\"api-index-group\">",
+    "<a href=\"#api-streaming\" class=\"api-index-heading\">Streaming</a>",
+    "<span class=\"api-index-desc\">HLS and MPEG-TS video streams.</span>",
+    "<a href=\"#api-streaming\"><code>GET /hls/:name/stream.m3u8</code></a>",
+    "<a href=\"#api-streaming\"><code>GET /stream/:name</code></a>",
+    "<a href=\"#api-streaming\"><code>GET /play</code></a>",
+    "</div>",
+
+    "<div class=\"api-index-group\">",
+    "<a href=\"#api-playlist\" class=\"api-index-heading\">Playlist</a>",
+    "<span class=\"api-index-desc\">M3U playlist for Channels DVR.</span>",
+    "<a href=\"#api-playlist\"><code>GET /playlist</code></a>",
+    "</div>",
+
+    "<div class=\"api-index-group\">",
+    "<a href=\"#api-channels\" class=\"api-index-heading\">Channels</a>",
+    "<span class=\"api-index-desc\">Add, edit, import, and toggle channel definitions.</span>",
+    "<a href=\"#api-channels\"><code>POST /config/channels</code></a>",
+    "<a href=\"#api-channels\"><code>GET /config/channels/export</code></a>",
+    "<a href=\"#api-channels\"><code>POST /config/channels/import</code></a>",
+    "</div>",
+
+    "<div class=\"api-index-group\">",
+    "<a href=\"#api-providers\" class=\"api-index-heading\">Providers</a>",
+    "<span class=\"api-index-desc\">Channel discovery, provider selection, and playlist filtering.</span>",
+    "<a href=\"#api-providers\"><code>GET /providers/:slug/channels</code></a>",
+    "<a href=\"#api-providers\"><code>POST /config/provider</code></a>",
+    "<a href=\"#api-providers\"><code>POST /config/provider-filter</code></a>",
+    "</div>",
+
+    "<div class=\"api-index-group\">",
+    "<a href=\"#api-auth\" class=\"api-index-heading\">Authentication</a>",
+    "<span class=\"api-index-desc\">TV provider login sessions.</span>",
+    "<a href=\"#api-auth\"><code>POST /auth/login</code></a>",
+    "<a href=\"#api-auth\"><code>POST /auth/done</code></a>",
+    "</div>",
+
+    "<div class=\"api-index-group\">",
+    "<a href=\"#api-management\" class=\"api-index-heading\">Management</a>",
+    "<span class=\"api-index-desc\">List channels, view and control active streams.</span>",
+    "<a href=\"#api-management\"><code>GET /channels</code></a>",
+    "<a href=\"#api-management\"><code>GET /streams</code></a>",
+    "<a href=\"#api-management\"><code>DELETE /streams/:id</code></a>",
+    "</div>",
+
+    "<div class=\"api-index-group\">",
+    "<a href=\"#api-settings\" class=\"api-index-heading\">Settings</a>",
+    "<span class=\"api-index-desc\">Save, export, and import server configuration.</span>",
+    "<a href=\"#api-settings\"><code>POST /config</code></a>",
+    "<a href=\"#api-settings\"><code>GET /config/export</code></a>",
+    "<a href=\"#api-settings\"><code>POST /config/import</code></a>",
+    "</div>",
+
+    "<div class=\"api-index-group\">",
+    "<a href=\"#api-diagnostics\" class=\"api-index-heading\">Diagnostics</a>",
+    "<span class=\"api-index-desc\">Health checks, logs, and real-time monitoring.</span>",
+    "<a href=\"#api-diagnostics\"><code>GET /health</code></a>",
+    "<a href=\"#api-diagnostics\"><code>GET /logs</code></a>",
+    "<a href=\"#api-diagnostics\"><code>GET /logs/stream</code></a>",
+    "</div>",
+
+    "</div>",
     "</div>",
 
     // Streaming endpoints.
     "<div class=\"section\">",
-    "<h3>Streaming</h3>",
+    "<h3 id=\"api-streaming\">Streaming</h3>",
     "<table>",
     "<tr><th style=\"width: 35%;\">Endpoint</th><th>Description</th></tr>",
     "<tr>",
@@ -504,7 +890,9 @@ function generateApiReferenceContent(): string {
     "<tr>",
     "<td class=\"endpoint\"><code>GET /play</code></td>",
     "<td>Stream any URL without creating a channel definition. Pass the URL as <code>?url=&lt;url&gt;</code>. " +
-    "Advanced: <code>&amp;profile=</code> overrides auto-detection, <code>&amp;selector=</code> picks a channel on multi-channel sites.</td>",
+    "Advanced: <code>&amp;profile=</code> overrides auto-detection, <code>&amp;selector=</code> picks a channel on multi-channel sites, " +
+    "<code>&amp;clickToPlay=true</code> clicks the video to start playback, <code>&amp;clickSelector=</code> specifies a play button element to click " +
+    "(implies clickToPlay).</td>",
     "</tr>",
     "<tr>",
     "<td class=\"endpoint\"><code>GET /stream/:name</code></td>",
@@ -515,84 +903,30 @@ function generateApiReferenceContent(): string {
 
     // Playlist endpoints.
     "<div class=\"section\">",
-    "<h3>Playlist</h3>",
+    "<h3 id=\"api-playlist\">Playlist</h3>",
     "<table>",
     "<tr><th style=\"width: 35%;\">Endpoint</th><th>Description</th></tr>",
     "<tr>",
     "<td class=\"endpoint\"><a href=\"/playlist\"><code>GET /playlist</code></a></td>",
-    "<td>M3U playlist of all channels in Channels DVR format. Use this URL when adding PrismCast as a custom channel source.</td>",
+    "<td>M3U playlist of all channels in Channels DVR format. Use this URL when adding PrismCast as a custom channel source. " +
+    "Optional <code>?provider=</code> query parameter filters by streaming provider: " +
+    "<code>?provider=yttv</code> (single), <code>?provider=yttv,sling</code> (multi-include), " +
+    "<code>?provider=-hulu</code> (exclude). Tags are case-insensitive. " +
+    "<strong>This only controls which channels appear in the playlist, not which provider is used for tuning.</strong></td>",
     "</tr>",
     "</table>",
     "</div>",
 
-    // Management endpoints.
+    // Channel endpoints.
     "<div class=\"section\">",
-    "<h3>Management</h3>",
+    "<h3 id=\"api-channels\">Channels</h3>",
+    "<p>Channel definitions, import/export, and predefined channel management.</p>",
     "<table>",
     "<tr><th style=\"width: 35%;\">Endpoint</th><th>Description</th></tr>",
-    "<tr>",
-    "<td class=\"endpoint\"><a href=\"/channels\"><code>GET /channels</code></a></td>",
-    "<td>List all channels (predefined + user) as JSON with source, enabled status, and channel metadata.</td>",
-    "</tr>",
-    "<tr>",
-    "<td class=\"endpoint\"><a href=\"/streams\"><code>GET /streams</code></a></td>",
-    "<td>List all currently active streams with their ID, channel, URL, duration, and status.</td>",
-    "</tr>",
-    "<tr>",
-    "<td class=\"endpoint\"><code>GET /streams/status</code></td>",
-    "<td>Server-Sent Events stream for real-time stream and system status updates.</td>",
-    "</tr>",
-    "<tr>",
-    "<td class=\"endpoint\"><code>DELETE /streams/:id</code></td>",
-    "<td>Terminate a specific stream by its numeric ID. Returns 204 on success, 404 if not found.</td>",
-    "</tr>",
-    "</table>",
-    "</div>",
-
-    // Authentication endpoints.
-    "<div class=\"section\">",
-    "<h3>Authentication</h3>",
-    "<table>",
-    "<tr><th style=\"width: 35%;\">Endpoint</th><th>Description</th></tr>",
-    "<tr>",
-    "<td class=\"endpoint\"><code>POST /auth/login</code></td>",
-    "<td>Start login mode for a channel. Body: <code>{ \"channel\": \"name\" }</code> or <code>{ \"url\": \"...\" }</code></td>",
-    "</tr>",
-    "<tr>",
-    "<td class=\"endpoint\"><code>POST /auth/done</code></td>",
-    "<td>End login mode and close the login browser tab.</td>",
-    "</tr>",
-    "<tr>",
-    "<td class=\"endpoint\"><a href=\"/auth/status\"><code>GET /auth/status</code></a></td>",
-    "<td>Get current login status including whether login mode is active and which channel.</td>",
-    "</tr>",
-    "</table>",
-    "</div>",
-
-    // Configuration endpoints.
-    "<div class=\"section\">",
-    "<h3>Configuration</h3>",
-    "<table>",
-    "<tr><th style=\"width: 35%;\">Endpoint</th><th>Description</th></tr>",
-    "<tr>",
-    "<td class=\"endpoint\"><code>POST /config</code></td>",
-    "<td>Save configuration settings. Returns <code>{ success, message, willRestart, deferred, activeStreams }</code></td>",
-    "</tr>",
-    "<tr>",
-    "<td class=\"endpoint\"><a href=\"/config/export\"><code>GET /config/export</code></a></td>",
-    "<td>Export current configuration as a JSON file download.</td>",
-    "</tr>",
-    "<tr>",
-    "<td class=\"endpoint\"><code>POST /config/import</code></td>",
-    "<td>Import configuration from JSON. Server restarts to apply changes (if running as service).</td>",
-    "</tr>",
-    "<tr>",
-    "<td class=\"endpoint\"><code>POST /config/restart-now</code></td>",
-    "<td>Force immediate server restart regardless of active streams. Only works when running as a service.</td>",
-    "</tr>",
     "<tr>",
     "<td class=\"endpoint\"><code>POST /config/channels</code></td>",
-    "<td>Add, edit, or delete user channels. Body includes <code>action</code> (add/edit/delete) and channel data.</td>",
+    "<td>Add, edit, delete, or revert user channels. Body includes <code>action</code> (add/edit/delete/revert) and channel data. " +
+    "Revert removes a predefined channel override, restoring defaults.</td>",
     "</tr>",
     "<tr>",
     "<td class=\"endpoint\"><a href=\"/config/channels/export\"><code>GET /config/channels/export</code></a></td>",
@@ -617,9 +951,112 @@ function generateApiReferenceContent(): string {
     "</table>",
     "</div>",
 
+    // Provider endpoints.
+    "<div class=\"section\">",
+    "<h3 id=\"api-providers\">Providers</h3>",
+    "<p>Channel discovery, provider selection, and filtering for multi-provider channels.</p>",
+    "<table>",
+    "<tr><th style=\"width: 35%;\">Endpoint</th><th>Description</th></tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><code>GET /providers/:slug/channels</code></td>",
+    "<td>Discover all available channels for a provider. Returns a JSON array of channel objects with <code>name</code>, <code>channelSelector</code>, " +
+    "and optional <code>affiliate</code> and <code>tier</code> fields. Provider slugs: <code>fox</code>, <code>hbo</code>, <code>hulu</code>, " +
+    "<code>sling</code>, <code>yttv</code>. Returns cached results instantly when a prior tune or discovery call has already enumerated the lineup. " +
+    "Add <code>?refresh=true</code> to clear caches and force a fresh discovery walk.</td>",
+    "</tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><code>POST /config/provider</code></td>",
+    "<td>Update provider selection for a multi-provider channel. Body: <code>{ \"channel\": \"nbc\", \"provider\": \"nbc-hulu\" }</code></td>",
+    "</tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><code>POST /config/provider-filter</code></td>",
+    "<td>Set enabled provider tags. Body: <code>{ \"enabledProviders\": [\"hulu\", \"yttv\"] }</code>. Empty array disables filter.</td>",
+    "</tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><code>POST /config/provider-bulk-assign</code></td>",
+    "<td>Assign a provider to all multi-provider channels. Body: <code>{ \"provider\": \"hulu\" }</code>. " +
+    "Returns <code>{ affected, previousSelections, selections }</code></td>",
+    "</tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><code>POST /config/provider-bulk-restore</code></td>",
+    "<td>Restore previous provider selections (undo bulk assign). Body: <code>{ \"selections\": { \"nbc\": \"nbc-hulu\", \"fox\": null } }</code>. " +
+    "A <code>null</code> value restores the channel to its default provider.</td>",
+    "</tr>",
+    "</table>",
+    "</div>",
+
+    // Authentication endpoints.
+    "<div class=\"section\">",
+    "<h3 id=\"api-auth\">Authentication</h3>",
+    "<table>",
+    "<tr><th style=\"width: 35%;\">Endpoint</th><th>Description</th></tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><code>POST /auth/login</code></td>",
+    "<td>Start login mode for a channel. Body: <code>{ \"channel\": \"name\" }</code> or <code>{ \"url\": \"...\" }</code></td>",
+    "</tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><code>POST /auth/done</code></td>",
+    "<td>End login mode and close the login browser tab.</td>",
+    "</tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><a href=\"/auth/status\"><code>GET /auth/status</code></a></td>",
+    "<td>Get current login status including whether login mode is active and which channel.</td>",
+    "</tr>",
+    "</table>",
+    "</div>",
+
+    // Management endpoints.
+    "<div class=\"section\">",
+    "<h3 id=\"api-management\">Management</h3>",
+    "<table>",
+    "<tr><th style=\"width: 35%;\">Endpoint</th><th>Description</th></tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><a href=\"/channels\"><code>GET /channels</code></a></td>",
+    "<td>List all channels (predefined + user) as JSON with source, enabled status, and channel metadata.</td>",
+    "</tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><a href=\"/streams\"><code>GET /streams</code></a></td>",
+    "<td>List all currently active streams with their ID, channel, URL, duration, and status.</td>",
+    "</tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><code>GET /streams/status</code></td>",
+    "<td>Server-Sent Events stream for real-time stream and system status updates.</td>",
+    "</tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><code>DELETE /streams/:id</code></td>",
+    "<td>Terminate a specific stream by its numeric ID. Returns 200 on success, 404 if not found.</td>",
+    "</tr>",
+    "</table>",
+    "</div>",
+
+    // Settings endpoints.
+    "<div class=\"section\">",
+    "<h3 id=\"api-settings\">Settings</h3>",
+    "<p>Server configuration and backup.</p>",
+    "<table>",
+    "<tr><th style=\"width: 35%;\">Endpoint</th><th>Description</th></tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><code>POST /config</code></td>",
+    "<td>Save configuration settings. Returns <code>{ success, message, willRestart, deferred, activeStreams }</code></td>",
+    "</tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><a href=\"/config/export\"><code>GET /config/export</code></a></td>",
+    "<td>Export current configuration as a JSON file download.</td>",
+    "</tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><code>POST /config/import</code></td>",
+    "<td>Import configuration from JSON. Server restarts to apply changes (if running as service).</td>",
+    "</tr>",
+    "<tr>",
+    "<td class=\"endpoint\"><code>POST /config/restart-now</code></td>",
+    "<td>Force immediate server restart regardless of active streams. Only works when running as a service.</td>",
+    "</tr>",
+    "</table>",
+    "</div>",
+
     // Diagnostics endpoints.
     "<div class=\"section\">",
-    "<h3>Diagnostics</h3>",
+    "<h3 id=\"api-diagnostics\">Diagnostics</h3>",
     "<table>",
     "<tr><th style=\"width: 35%;\">Endpoint</th><th>Description</th></tr>",
     "<tr>",
@@ -759,7 +1196,12 @@ function generateLogsContent(): string {
     "  var cls = 'log-entry';",
     "  if(entry.level === 'error') { cls += ' log-error'; }",
     "  else if(entry.level === 'warn') { cls += ' log-warn'; }",
-    "  var levelBadge = entry.level !== 'info' ? '[' + entry.level.toUpperCase() + '] ' : '';",
+    "  else if(entry.level === 'debug') { cls += ' log-debug'; }",
+    "  var levelBadge = '';",
+    "  if(entry.level !== 'info') {",
+    "    var tag = entry.categoryTag ? entry.level.toUpperCase() + ':' + entry.categoryTag : entry.level.toUpperCase();",
+    "    levelBadge = '[' + escapeHtml(tag) + '] ';",
+    "  }",
     "  return '<div class=\"' + cls + '\">[' + escapeHtml(entry.timestamp) + '] ' + levelBadge + escapeHtml(entry.message) + '</div>';",
     "}",
 
@@ -780,29 +1222,49 @@ function generateLogsContent(): string {
     "  return div.innerHTML;",
     "}",
 
+    // Track the last time any SSE event was received from the logs stream. Used by the staleness checker below.
+    "var lastLogsEventTime = 0;",
+    "var logsStalenessInterval = null;",
+
     // Connect to the SSE stream.
     "function connectSSE() {",
     "  if(eventSource) { eventSource.close(); }",
-    "  var url = '/logs/stream';",
-    "  eventSource = new EventSource(url);",
+    "  if(logsStalenessInterval) { clearInterval(logsStalenessInterval); }",
+    "  eventSource = new EventSource('/logs/stream');",
+    "  lastLogsEventTime = Date.now();",
     "  sseStatus.innerHTML = '<span class=\"status-dot\" style=\"color: var(--stream-buffering);\">&#9679;</span> Connecting...';",
+
+    // Same on() wrapper pattern as the status stream. Updates the staleness timestamp on every data event so the 45-second checker stays
+    // satisfied as long as any data (heartbeats or log entries) is flowing. Lifecycle handlers (onopen, onerror) stay outside the wrapper.
+    "  function on(event, handler) {",
+    "    eventSource.addEventListener(event, function(e) {",
+    "      lastLogsEventTime = Date.now();",
+    "      if(handler) { handler(e); }",
+    "    });",
+    "  }",
+    "  on('heartbeat');",
+    "  on('message', function(e) {",
+    "    try {",
+    "      var entry = JSON.parse(e.data);",
+    "      appendLogEntry(entry);",
+    "    } catch(err) { /* Ignore parse errors. */ }",
+    "  });",
     "  eventSource.onopen = function() {",
+    "    lastLogsEventTime = Date.now();",
     "    sseStatus.innerHTML = '<span class=\"status-dot\" style=\"color: var(--stream-healthy);\">&#9679;</span> Live';",
     "    loadLogs();",
-    "  };",
-    "  eventSource.onmessage = function(event) {",
-    "    try {",
-    "      var entry = JSON.parse(event.data);",
-    "      appendLogEntry(entry);",
-    "    } catch(e) { /* Ignore parse errors. */ }",
     "  };",
     "  eventSource.onerror = function() {",
     "    sseStatus.innerHTML = '<span class=\"status-dot\" style=\"color: var(--stream-error);\">&#9679;</span> Disconnected';",
     "  };",
+    "  logsStalenessInterval = setInterval(function() {",
+    "    if((Date.now() - lastLogsEventTime) > 45000) { connectSSE(); }",
+    "  }, 45000);",
     "}",
 
     // Disconnect from the SSE stream.
     "function disconnectSSE() {",
+    "  if(logsStalenessInterval) { clearInterval(logsStalenessInterval); logsStalenessInterval = null; }",
     "  if (eventSource) {",
     "    eventSource.close();",
     "    eventSource = null;",
@@ -889,9 +1351,6 @@ function generateConfigContent(): string {
 
   const tabs = getUITabs();
   const lines: string[] = [];
-
-  // Status message area for AJAX feedback.
-  lines.push("<div id=\"config-status\" class=\"config-status\" style=\"display: none;\"></div>");
 
   // Environment variable warning if applicable.
   if(hasEnvOverrides()) {
@@ -1009,32 +1468,49 @@ function generateConfigSubtabScript(): string {
     "    }",
     "  }",
 
-    // Timeout handle for auto-dismissing success messages.
-    "  var statusTimeout = null;",
-
-    // Show status message. Success messages auto-dismiss after 5 seconds.
-    "  function showStatus(message, type) {",
-    "    var status = document.getElementById('config-status');",
-    "    if (!status) return;",
-    "    if (statusTimeout) { clearTimeout(statusTimeout); statusTimeout = null; }",
-    "    status.textContent = message;",
-    "    status.className = 'config-status ' + (type || 'info');",
-    "    status.style.opacity = '1';",
-    "    status.style.display = 'block';",
-    "    status.scrollIntoView({ behavior: 'smooth', block: 'nearest' });",
-    "    if (type === 'success') {",
-    "      statusTimeout = setTimeout(function() { hideStatus(); }, 10000);",
+    // Show a toast notification. Auto-dismiss durations: success/info = 5s, warning = 8s, error = no auto-dismiss. Optional action: { label, onclick } appends an
+    // inline button between the message text and the close button.
+    "  function showToast(message, type, duration, action) {",
+    "    var container = document.getElementById('toast-container');",
+    "    if (!container) return;",
+    "    var toast = document.createElement('div');",
+    "    toast.className = 'toast ' + (type || 'info');",
+    "    toast.textContent = message;",
+    "    toast.setAttribute('role', (type === 'error' || type === 'warning') ? 'alert' : 'status');",
+    "    if (action && action.label) {",
+    "      var actionBtn = document.createElement('button');",
+    "      actionBtn.type = 'button';",
+    "      actionBtn.className = 'toast-action';",
+    "      actionBtn.textContent = action.label;",
+    "      actionBtn.onclick = function() { if (action.onclick) action.onclick(); dismissToast(toast); };",
+    "      toast.appendChild(actionBtn);",
     "    }",
+    "    var closeBtn = document.createElement('button');",
+    "    closeBtn.type = 'button';",
+    "    closeBtn.className = 'toast-close';",
+    "    closeBtn.textContent = '\\u00d7';",
+    "    closeBtn.setAttribute('aria-label', 'Dismiss');",
+    "    closeBtn.onclick = function() { dismissToast(toast); };",
+    "    toast.appendChild(closeBtn);",
+    "    container.appendChild(toast);",
+    "    var ms = duration !== undefined ? duration : type === 'error' ? 0 : type === 'warning' ? 8000 : 5000;",
+    "    if (ms > 0) { setTimeout(function() { dismissToast(toast); }, ms); }",
     "  }",
 
-    // Hide status message with fade-out effect.
-    "  function hideStatus() {",
-    "    var status = document.getElementById('config-status');",
-    "    if (statusTimeout) { clearTimeout(statusTimeout); statusTimeout = null; }",
-    "    if (status) {",
-    "      status.style.opacity = '0';",
-    "      setTimeout(function() { status.style.display = 'none'; }, 300);",
-    "    }",
+    // Dismiss a toast with slide-out animation.
+    "  function dismissToast(toast) {",
+    "    if (toast.classList.contains('toast-exit')) return;",
+    "    toast.classList.add('toast-exit');",
+    "    toast.addEventListener('animationend', function() { if (toast.parentNode) toast.parentNode.removeChild(toast); });",
+    "  }",
+
+    // Hint appended to success toasts when a channel operation changes M3U playlist content that Channels DVR consumes.
+    "  var PLAYLIST_HINT = ' Reload the playlist in Channels DVR to see this change.';",
+
+    // Queue a toast to appear after the next page reload.
+    "  function showToastAfterReload(message, type) {",
+    "    sessionStorage.setItem('pendingToast', JSON.stringify({ message: message, type: type || 'success' }));",
+    "    location.reload();",
     "  }",
 
     // Interval handle for restart polling.
@@ -1066,7 +1542,7 @@ function generateConfigSubtabScript(): string {
     "  window.cancelPendingRestart = function() {",
     "    pendingRestart = false;",
     "    document.getElementById('restart-dialog').style.display = 'none';",
-    "    showStatus('Restart cancelled. Changes will apply on next restart.', 'info');",
+    "    showToast('Restart cancelled. Changes will apply on next restart.', 'info');",
     "  };",
 
     // Force immediate restart despite active streams.
@@ -1084,7 +1560,7 @@ function generateConfigSubtabScript(): string {
     "        }",
     "      })",
     "      .catch(function(err) {",
-    "        showStatus('Failed to restart: ' + err.message, 'error');",
+    "        showToast('Failed to restart: ' + err.message, 'error');",
     "      });",
     "  };",
 
@@ -1097,7 +1573,7 @@ function generateConfigSubtabScript(): string {
     "        }",
     "      })",
     "      .catch(function() {",
-    "        showStatus('Failed to trigger restart. Please restart manually.', 'error');",
+    "        showToast('Failed to trigger restart. Please restart manually.', 'error');",
     "      });",
     "  }",
 
@@ -1105,7 +1581,7 @@ function generateConfigSubtabScript(): string {
     "  function waitForServerRestart() {",
     "    var attempts = 0;",
     "    var maxAttempts = 30;",
-    "    showStatus('Restarting server...', 'info');",
+    "    showToast('Restarting server...', 'info', 0);",
     "    if (restartPollInterval) { clearInterval(restartPollInterval); }",
     "    restartPollInterval = setInterval(function() {",
     "      attempts++;",
@@ -1114,17 +1590,14 @@ function generateConfigSubtabScript(): string {
     "          if (response.ok) {",
     "            clearInterval(restartPollInterval);",
     "            restartPollInterval = null;",
-    "            showStatus('Server restarted. Reloading...', 'success');",
-    "            setTimeout(function() { window.location.reload(); }, 500);",
+    "            showToastAfterReload('Server restarted.', 'success');",
     "          }",
     "        })",
     "        .catch(function() {",
     "          if (attempts >= maxAttempts) {",
     "            clearInterval(restartPollInterval);",
     "            restartPollInterval = null;",
-    "            showStatus('Server did not restart within 30 seconds. Please check the server manually.', 'error');",
-    "          } else {",
-    "            showStatus('Restarting server... (' + attempts + 's)', 'info');",
+    "            showToast('Server did not restart within 30 seconds. Please check the server manually.', 'error');",
     "          }",
     "        });",
     "    }, 1000);",
@@ -1137,7 +1610,7 @@ function generateConfigSubtabScript(): string {
     "    return div.innerHTML;",
     "  }",
 
-    // Open the changelog modal and fetch content dynamically.
+    // Open the changelog modal and fetch content dynamically. Also checks whether an upgrade button should be shown.
     "  window.openChangelogModal = function() {",
     "    var modal = document.getElementById('changelog-modal');",
     "    if (!modal) return;",
@@ -1145,10 +1618,12 @@ function generateConfigSubtabScript(): string {
     "    var loading = modal.querySelector('.changelog-loading');",
     "    var content = modal.querySelector('.changelog-content');",
     "    var error = modal.querySelector('.changelog-error');",
+    "    var upgradeBtn = document.getElementById('changelog-upgrade-btn');",
     "    modal.style.display = 'flex';",
     "    loading.style.display = 'block';",
     "    content.style.display = 'none';",
     "    error.style.display = 'none';",
+    "    if (upgradeBtn) upgradeBtn.style.display = 'none';",
     "    fetch('/version/changelog')",
     "      .then(function(res) { return res.json(); })",
     "      .then(function(data) {",
@@ -1165,6 +1640,7 @@ function generateConfigSubtabScript(): string {
     "        } else {",
     "          error.style.display = 'block';",
     "        }",
+    "        if (data.updateAvailable && upgradeBtn) { upgradeBtn.style.display = ''; }",
     "      })",
     "      .catch(function() {",
     "        loading.style.display = 'none';",
@@ -1178,7 +1654,43 @@ function generateConfigSubtabScript(): string {
     "    if (modal) { modal.style.display = 'none'; }",
     "  };",
 
-    // Check for updates manually.
+    // Start the upgrade process from the changelog modal. Fetches upgrade info, confirms with the user if there are active streams, then executes the upgrade.
+    "  window.startUpgrade = function() {",
+    "    fetch('/upgrade/info')",
+    "      .then(function(res) { return res.json(); })",
+    "      .then(function(info) {",
+    "        if (!info.upgradeable) {",
+    "          closeChangelogModal();",
+    "          var msg = info.method === 'docker'",
+    "            ? 'Docker containers cannot be upgraded in-place. Pull the latest image and recreate the container.'",
+    "            : 'Manual upgrade required: ' + info.upgradeCommand;",
+    "          showToast(msg, 'info', 8000);",
+    "          return;",
+    "        }",
+    "        var streamCount = Object.keys(streamData).length;",
+    "        if (streamCount > 0) {",
+    "          if (!confirm('There are ' + streamCount + ' active stream(s). Upgrading will interrupt them. Continue?')) return;",
+    "        }",
+    "        closeChangelogModal();",
+    "        showToast('Upgrading PrismCast...', 'info', 0);",
+    "        return fetch('/upgrade', { method: 'POST' })",
+    "          .then(function(res) { return res.json(); })",
+    "          .then(function(result) {",
+    "            if (result.success && result.willRestart) {",
+    "              waitForServerRestart();",
+    "            } else if (result.success) {",
+    "              showToast('Upgrade complete. Please restart PrismCast manually.', 'success', 8000);",
+    "            } else {",
+    "              showToast('Upgrade failed: ' + result.message, 'error');",
+    "            }",
+    "          });",
+    "      })",
+    "      .catch(function(err) {",
+    "        showToast('Upgrade failed: ' + err.message, 'error');",
+    "      });",
+    "  };",
+
+    // Check for updates manually. Updates the version link in-place when a new version is found.
     "  window.checkForUpdates = function() {",
     "    var btn = document.querySelector('.version-check');",
     "    if (!btn || btn.classList.contains('checking')) return;",
@@ -1187,10 +1699,12 @@ function generateConfigSubtabScript(): string {
     "      .then(function(res) { return res.json(); })",
     "      .then(function(data) {",
     "        btn.classList.remove('checking');",
-    "        if (data.updateAvailable) {",
-    // Only reload if update wasn't already visible (need to fetch changelog modal).
-    "          var alreadyShowing = document.querySelector('.version-update');",
-    "          if (!alreadyShowing) { location.reload(); }",
+    "        if (data.updateAvailable && data.latestVersion) {",
+    "          var link = document.querySelector('.version-container .version');",
+    "          if (link && !link.classList.contains('version-update')) {",
+    "            link.textContent = 'v' + data.currentVersion + ' \\u2192 v' + data.latestVersion;",
+    "            link.classList.add('version-update');",
+    "          }",
     "        } else {",
     "          btn.classList.add('up-to-date');",
     "          setTimeout(function() { btn.classList.remove('up-to-date'); }, 2000);",
@@ -1291,6 +1805,7 @@ function generateConfigSubtabScript(): string {
     "          btn.type = 'button';",
     "          btn.className = 'btn-reset';",
     "          btn.title = 'Reset to default';",
+    "          btn.setAttribute('aria-label', 'Reset to default');",
     "          btn.innerHTML = '&#8635;';",
     "          btn.onclick = function() { resetSetting(path); };",
     "          row.appendChild(btn);",
@@ -1336,7 +1851,7 @@ function generateConfigSubtabScript(): string {
     "        updateDependentFields(cbInputs[j].id);",
     "      }",
     "    }",
-    "    showStatus('Settings reset to defaults. Click ' + (isServiceMode ? 'Save & Restart' : 'Save Settings') + ' to apply changes.', 'info');",
+    "    showToast('Settings reset to defaults. Click ' + (isServiceMode ? 'Save & Restart' : 'Save Settings') + ' to apply changes.', 'info');",
     "  };",
 
     // Toggle collapsible section in Advanced tab.
@@ -1401,13 +1916,12 @@ function generateConfigSubtabScript(): string {
     "        updateDependentFields(cbInputs[j].id);",
     "      }",
     "    }",
-    "    showStatus('All settings reset to defaults. Click ' + (isServiceMode ? 'Save & Restart' : 'Save Settings') + ' to apply changes.', 'info');",
+    "    showToast('All settings reset to defaults. Click ' + (isServiceMode ? 'Save & Restart' : 'Save Settings') + ' to apply changes.', 'info');",
     "  };",
 
     // Submit settings form via AJAX.
     "  window.submitSettingsForm = function(event) {",
     "    event.preventDefault();",
-    "    hideStatus();",
     "    clearFieldErrors();",
     "    var form = document.getElementById('settings-form');",
     "    var saveBtn = document.getElementById('save-btn');",
@@ -1442,18 +1956,18 @@ function generateConfigSubtabScript(): string {
     "            waitForServerRestart();",
     "          }",
     "        } else {",
-    "          showStatus(result.data.message || 'Configuration saved.', 'info');",
+    "          showToast(result.data.message || 'Configuration saved.', 'info');",
     "        }",
     "      } else if (result.data.errors) {",
     "        displayFieldErrors(result.data.errors);",
-    "        showStatus('Please correct the errors below.', 'error');",
+    "        showToast('Please correct the errors below.', 'error');",
     "      } else {",
-    "        showStatus(result.data.message || 'Failed to save configuration.', 'error');",
+    "        showToast(result.data.message || 'Failed to save configuration.', 'error');",
     "      }",
     "    })",
     "    .catch(function(err) {",
     "      if (saveBtn) saveBtn.classList.remove('loading');",
-    "      showStatus('Failed to save configuration: ' + err.message, 'error');",
+    "      showToast('Failed to save configuration: ' + err.message, 'error');",
     "    });",
     "    return false;",
     "  };",
@@ -1472,7 +1986,7 @@ function generateConfigSubtabScript(): string {
     "        document.body.removeChild(a);",
     "        window.URL.revokeObjectURL(url);",
     "      })",
-    "      .catch(function(err) { alert('Failed to export configuration: ' + err.message); });",
+    "      .catch(function(err) { showToast('Failed to export configuration: ' + err.message, 'error'); });",
     "  };",
 
     // Import configuration from file.
@@ -1492,7 +2006,7 @@ function generateConfigSubtabScript(): string {
     "          .then(function(response) { return response.json().then(function(data) { return { ok: response.ok, data: data }; }); })",
     "          .then(function(result) {",
     "            if (result.ok && result.data.success) {",
-    "              alert(result.data.message || 'Configuration imported.');",
+    "              showToast(result.data.message || 'Configuration imported.', 'success');",
     "              if (result.data.willRestart) {",
     "                if (result.data.deferred) {",
     "                  showPendingRestartDialog(result.data.activeStreams);",
@@ -1504,10 +2018,10 @@ function generateConfigSubtabScript(): string {
     "              throw new Error(result.data.message || result.data.error || 'Import failed');",
     "            }",
     "          })",
-    "          .catch(function(err) { alert('Failed to import configuration: ' + err.message); });",
+    "          .catch(function(err) { showToast('Failed to import configuration: ' + err.message, 'error'); });",
     "        }",
     "      } catch (err) {",
-    "        alert('Invalid JSON file: ' + err.message);",
+    "        showToast('Invalid JSON file: ' + err.message, 'error');",
     "      }",
     "      fileInput.value = '';",
     "    };",
@@ -1528,7 +2042,7 @@ function generateConfigSubtabScript(): string {
     "        document.body.removeChild(a);",
     "        window.URL.revokeObjectURL(url);",
     "      })",
-    "      .catch(function(err) { alert('Failed to export channels: ' + err.message); });",
+    "      .catch(function(err) { showToast('Failed to export channels: ' + err.message, 'error'); });",
     "  };",
 
     // Import channels from file.
@@ -1547,16 +2061,15 @@ function generateConfigSubtabScript(): string {
     "          })",
     "          .then(function(response) {",
     "            if (response.ok) {",
-    "              alert('Channels imported successfully.');",
-    "              window.location.reload();",
+    "              showToastAfterReload('Channels imported successfully.' + PLAYLIST_HINT, 'success');",
     "            } else {",
     "              return response.text().then(function(text) { throw new Error(text); });",
     "            }",
     "          })",
-    "          .catch(function(err) { alert('Failed to import channels: ' + err.message); });",
+    "          .catch(function(err) { showToast('Failed to import channels: ' + err.message, 'error'); });",
     "        }",
     "      } catch (err) {",
-    "        alert('Invalid JSON file: ' + err.message);",
+    "        showToast('Invalid JSON file: ' + err.message, 'error');",
     "      }",
     "      fileInput.value = '';",
     "    };",
@@ -1590,13 +2103,13 @@ function generateConfigSubtabScript(): string {
     "            }",
     "            if (data.errors.length > 5) msg += '  ... and ' + (data.errors.length - 5) + ' more\\n';",
     "          }",
-    "          alert(msg);",
-    "          if (data.imported > 0 || data.replaced > 0) window.location.reload();",
+    "          if (data.imported > 0 || data.replaced > 0) { showToastAfterReload(msg + PLAYLIST_HINT, 'success'); }",
+    "          else { showToast(msg, 'success'); }",
     "        } else {",
-    "          alert('M3U import failed: ' + (data.error || 'Unknown error'));",
+    "          showToast('M3U import failed: ' + (data.error || 'Unknown error'), 'error');",
     "        }",
     "      })",
-    "      .catch(function(err) { alert('Failed to import M3U: ' + err.message); });",
+    "      .catch(function(err) { showToast('Failed to import M3U: ' + err.message, 'error'); });",
     "      fileInput.value = '';",
     "    };",
     "    reader.readAsText(file);",
@@ -1770,7 +2283,6 @@ function generateConfigSubtabScript(): string {
     "    var formData = new FormData(form);",
     "    var data = {};",
     "    for (var pair of formData.entries()) { data[pair[0]] = pair[1]; }",
-    "    showStatus('Saving channel...', 'info');",
     "    fetch('/config/channels', {",
     "      method: 'POST',",
     "      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },",
@@ -1779,33 +2291,31 @@ function generateConfigSubtabScript(): string {
     "    .then(function(response) { return response.json().then(function(d) { return { ok: response.ok, data: d }; }); })",
     "    .then(function(result) {",
     "      if (result.ok && result.data.success) {",
-    "        showStatus(result.data.message, 'success');",
+    "        showToast(result.data.message, 'success');",
     "        if (result.data.html) {",
     "          insertChannelRow(result.data.html, result.data.key);",
-    "          if (action === 'add') {",
-    "            hideAddForm();",
-    "          } else {",
-    "            hideEditForm(result.data.key);",
-    "          }",
+    "          refilterChannelRows();",
+    "        }",
+    "        if (action === 'add') {",
+    "          hideAddForm();",
     "        } else {",
-    "          window.location.reload();",
+    "          hideEditForm(result.data.key);",
     "        }",
     "      } else if (result.data.errors) {",
     "        var errorMsgs = [];",
     "        for (var field in result.data.errors) { errorMsgs.push(field + ': ' + result.data.errors[field]); }",
-    "        showStatus('Validation errors: ' + errorMsgs.join(', '), 'error');",
+    "        showToast('Validation errors: ' + errorMsgs.join(', '), 'error');",
     "      } else {",
-    "        showStatus(result.data.message || 'Failed to save channel.', 'error');",
+    "        showToast(result.data.message || 'Failed to save channel.', 'error');",
     "      }",
     "    })",
-    "    .catch(function(err) { showStatus('Failed to save channel: ' + err.message, 'error'); });",
+    "    .catch(function(err) { showToast('Failed to save channel: ' + err.message, 'error'); });",
     "    return false;",
     "  };",
 
     // Delete channel via AJAX.
     "  window.deleteChannel = function(key) {",
     "    if (!confirm('Delete channel ' + key + '?')) return;",
-    "    showStatus('Deleting channel...', 'info');",
     "    fetch('/config/channels', {",
     "      method: 'POST',",
     "      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },",
@@ -1814,22 +2324,22 @@ function generateConfigSubtabScript(): string {
     "    .then(function(response) { return response.json().then(function(d) { return { ok: response.ok, data: d }; }); })",
     "    .then(function(result) {",
     "      if (result.ok && result.data.success) {",
-    "        showStatus(result.data.message, 'success');",
+    "        showToast(result.data.message, 'success');",
     "        if (result.data.html) {",
     "          insertChannelRow(result.data.html, result.data.key || key);",
+    "          refilterChannelRows();",
     "        } else {",
     "          removeChannelRow(result.data.key || key);",
     "        }",
     "      } else {",
-    "        showStatus(result.data.message || 'Failed to delete channel.', 'error');",
+    "        showToast(result.data.message || 'Failed to delete channel.', 'error');",
     "      }",
     "    })",
-    "    .catch(function(err) { showStatus('Failed to delete channel: ' + err.message, 'error'); });",
+    "    .catch(function(err) { showToast('Failed to delete channel: ' + err.message, 'error'); });",
     "  };",
 
     // Toggle a single predefined channel's enabled/disabled state.
     "  window.togglePredefinedChannel = function(key, enable) {",
-    "    showStatus((enable ? 'Enabling' : 'Disabling') + ' channel...', 'info');",
     "    fetch('/config/channels/toggle-predefined', {",
     "      method: 'POST',",
     "      headers: { 'Content-Type': 'application/json' },",
@@ -1838,18 +2348,53 @@ function generateConfigSubtabScript(): string {
     "    .then(function(response) { return response.json(); })",
     "    .then(function(result) {",
     "      if (result.success) {",
-    "        showStatus('Channel ' + key + ' ' + (enable ? 'enabled' : 'disabled') + '.', 'success');",
+    "        showToast('Channel ' + key + ' ' + (enable ? 'enabled' : 'disabled') + '.' + PLAYLIST_HINT, 'success');",
     "        updateChannelRowDisabledState(key, !enable);",
     "      } else {",
-    "        showStatus(result.error || 'Failed to toggle channel.', 'error');",
+    "        showToast(result.error || 'Failed to toggle channel.', 'error');",
     "      }",
     "    })",
-    "    .catch(function(err) { showStatus('Failed to toggle channel: ' + err.message, 'error'); });",
+    "    .catch(function(err) { showToast('Failed to toggle channel: ' + err.message, 'error'); });",
+    "  };",
+
+    // Update a channel row's provider selection in-place. Syncs the HTML selected attribute so filterChannelRows() restore logic works correctly. We iterate
+    // _allOptions (if present) rather than querySelectorAll because filtered-out options are removed from the DOM but still tracked in the array.
+    "  function updateChannelProviderUI(channelKey, variant) {",
+    "    var row = document.getElementById('display-row-' + channelKey);",
+    "    if (!row) return;",
+    "    var sel = row.querySelector('.provider-select');",
+    "    if (!sel) return;",
+    "    sel.value = variant;",
+    "    var allOpts = sel._allOptions || Array.prototype.slice.call(sel.querySelectorAll('option'));",
+    "    for (var oi = 0; oi < allOpts.length; oi++) {",
+    "      if (allOpts[oi].value === variant) { allOpts[oi].setAttribute('selected', ''); }",
+    "      else { allOpts[oi].removeAttribute('selected'); }",
+    "    }",
+    "  }",
+
+    // Update provider selection for a multi-provider channel.
+    "  window.updateProviderSelection = function(selectElement) {",
+    "    var channelKey = selectElement.getAttribute('data-channel');",
+    "    var providerKey = selectElement.value;",
+    "    fetch('/config/provider', {",
+    "      method: 'POST',",
+    "      headers: { 'Content-Type': 'application/json' },",
+    "      body: JSON.stringify({ channel: channelKey, provider: providerKey })",
+    "    })",
+    "    .then(function(response) { return response.json(); })",
+    "    .then(function(result) {",
+    "      if (result.success) {",
+    "        showToast('Provider updated. New streams will use the selected provider.', 'success');",
+    "        if (result.html) { insertChannelRow(result.html, channelKey); refilterChannelRows(); }",
+    "      } else {",
+    "        showToast(result.error || 'Failed to update provider.', 'error');",
+    "      }",
+    "    })",
+    "    .catch(function(err) { showToast('Failed to update provider: ' + err.message, 'error'); });",
     "  };",
 
     // Toggle all predefined channels' enabled/disabled state.
     "  window.toggleAllPredefined = function(enable) {",
-    "    showStatus((enable ? 'Enabling' : 'Disabling') + ' all predefined channels...', 'info');",
     "    fetch('/config/channels/toggle-all-predefined', {",
     "      method: 'POST',",
     "      headers: { 'Content-Type': 'application/json' },",
@@ -1858,17 +2403,55 @@ function generateConfigSubtabScript(): string {
     "    .then(function(response) { return response.json(); })",
     "    .then(function(result) {",
     "      if (result.success) {",
-    "        showStatus('All predefined channels ' + (enable ? 'enabled' : 'disabled') + '.', 'success');",
-    "        window.location.reload();",
+    "        showToast('All predefined channels ' + (enable ? 'enabled' : 'disabled') + '.' + PLAYLIST_HINT, 'success');",
+    "        var rows = document.querySelectorAll('tr[id^=\"display-row-\"]:not(.user-channel)');",
+    "        for (var i = 0; i < rows.length; i++) {",
+    "          var rowKey = rows[i].id.replace('display-row-', '');",
+    "          setRowDisabledState(rowKey, !enable);",
+    "        }",
+    "        updateBulkToggleButton();",
+    "        updateDisabledCount();",
     "      } else {",
-    "        showStatus(result.error || 'Failed to toggle channels.', 'error');",
+    "        showToast(result.error || 'Failed to toggle channels.', 'error');",
     "      }",
     "    })",
-    "    .catch(function(err) { showStatus('Failed to toggle channels: ' + err.message, 'error'); });",
+    "    .catch(function(err) { showToast('Failed to toggle channels: ' + err.message, 'error'); });",
     "  };",
 
-    // Update a channel row's disabled state without full page reload.
-    "  function updateChannelRowDisabledState(key, disabled) {",
+    // SVG icon strings for dynamic DOM manipulation when toggling button states.
+    "  var ICON_LOGIN_SVG = '<svg width=\"14\" height=\"14\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" " +
+    "stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M6.5 2H3.5a1 1 0 00-1 1v10a1 1 0 001 1h3\"/><path d=\"M10.5 11l3-3-3-3\"/>" +
+    "<path d=\"M13.5 8H6.5\"/></svg>';",
+    "  var ICON_ENABLE_SVG = '<svg width=\"14\" height=\"14\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" " +
+    "stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"8\" cy=\"8\" r=\"6\"/><path d=\"M5.5 8l2 2 3.5-4\"/></svg>';",
+    "  var ICON_DISABLE_SVG = '<svg width=\"14\" height=\"14\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" " +
+    "stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"8\" cy=\"8\" r=\"6\"/><path d=\"M5.5 5.5l5 5\"/></svg>';",
+
+    // Revert a channel override back to predefined defaults.
+    "  window.revertChannel = function(key) {",
+    "    if (!confirm('Revert channel ' + key + ' to predefined defaults?')) return;",
+    "    fetch('/config/channels', {",
+    "      method: 'POST',",
+    "      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },",
+    "      body: JSON.stringify({ action: 'revert', key: key })",
+    "    })",
+    "    .then(function(response) { return response.json().then(function(d) { return { ok: response.ok, data: d }; }); })",
+    "    .then(function(result) {",
+    "      if (result.ok && result.data.success) {",
+    "        showToast(result.data.message, 'success');",
+    "        if (result.data.html) {",
+    "          insertChannelRow(result.data.html, result.data.key || key);",
+    "          refilterChannelRows();",
+    "        }",
+    "      } else {",
+    "        showToast(result.data.message || 'Failed to revert channel.', 'error');",
+    "      }",
+    "    })",
+    "    .catch(function(err) { showToast('Failed to revert channel: ' + err.message, 'error'); });",
+    "  };",
+
+    // Set a channel row's disabled state without triggering count updates. Uses icon buttons. Used by toggleAllPredefined for efficient bulk updates.
+    "  function setRowDisabledState(key, disabled) {",
     "    var row = document.getElementById('display-row-' + key);",
     "    if (!row) return;",
     "    var btnGroup = row.querySelector('.btn-group');",
@@ -1876,29 +2459,51 @@ function generateConfigSubtabScript(): string {
     "    if (disabled) {",
     "      row.classList.add('channel-disabled');",
     "      row.classList.remove('user-channel');",
-    "      var loginBtn = btnGroup.querySelector('button[onclick*=\"startChannelLogin\"]');",
-    "      if (loginBtn) loginBtn.remove();",
-    "      var disableBtn = btnGroup.querySelector('.btn-disable');",
+    // Replace login icon with placeholder.
+    "      var loginBtn = btnGroup.querySelector('.btn-icon-login');",
+    "      if (loginBtn) {",
+    "        var placeholder = document.createElement('span');",
+    "        placeholder.className = 'btn-icon-placeholder';",
+    "        loginBtn.replaceWith(placeholder);",
+    "      }",
+    // Swap disable icon to enable icon.
+    "      var disableBtn = btnGroup.querySelector('.btn-icon-disable');",
     "      if (disableBtn) {",
-    "        disableBtn.className = 'btn btn-enable btn-sm';",
-    "        disableBtn.textContent = 'Enable';",
+    "        disableBtn.className = 'btn-icon btn-icon-enable';",
+    "        disableBtn.title = 'Enable';",
+    "        disableBtn.setAttribute('aria-label', 'Enable');",
+    "        disableBtn.innerHTML = ICON_ENABLE_SVG;",
     "        disableBtn.setAttribute('onclick', \"togglePredefinedChannel('\" + key + \"', true)\");",
     "      }",
     "    } else {",
     "      row.classList.remove('channel-disabled');",
-    "      var enableBtn = btnGroup.querySelector('.btn-enable');",
+    // Swap enable icon to disable icon.
+    "      var enableBtn = btnGroup.querySelector('.btn-icon-enable');",
     "      if (enableBtn) {",
-    "        var loginBtn = document.createElement('button');",
-    "        loginBtn.type = 'button';",
-    "        loginBtn.className = 'btn btn-secondary btn-sm';",
-    "        loginBtn.setAttribute('onclick', \"startChannelLogin('\" + key + \"')\");",
-    "        loginBtn.textContent = 'Login';",
-    "        btnGroup.insertBefore(loginBtn, enableBtn);",
-    "        enableBtn.className = 'btn btn-disable btn-sm';",
-    "        enableBtn.textContent = 'Disable';",
+    // Replace placeholder with login icon button.
+    "        var placeholder = btnGroup.querySelector('.btn-icon-placeholder');",
+    "        if (placeholder) {",
+    "          var newLoginBtn = document.createElement('button');",
+    "          newLoginBtn.type = 'button';",
+    "          newLoginBtn.className = 'btn-icon btn-icon-login';",
+    "          newLoginBtn.title = 'Login';",
+    "          newLoginBtn.setAttribute('aria-label', 'Login');",
+    "          newLoginBtn.innerHTML = ICON_LOGIN_SVG;",
+    "          newLoginBtn.setAttribute('onclick', \"startChannelLogin('\" + key + \"')\");",
+    "          placeholder.replaceWith(newLoginBtn);",
+    "        }",
+    "        enableBtn.className = 'btn-icon btn-icon-disable';",
+    "        enableBtn.title = 'Disable';",
+    "        enableBtn.setAttribute('aria-label', 'Disable');",
+    "        enableBtn.innerHTML = ICON_DISABLE_SVG;",
     "        enableBtn.setAttribute('onclick', \"togglePredefinedChannel('\" + key + \"', false)\");",
     "      }",
     "    }",
+    "  }",
+
+    // Update a single channel row's disabled state and refresh counts. Used by individual togglePredefinedChannel.
+    "  function updateChannelRowDisabledState(key, disabled) {",
+    "    setRowDisabledState(key, disabled);",
     "    updateBulkToggleButton();",
     "    updateDisabledCount();",
     "  };",
@@ -1919,13 +2524,236 @@ function generateConfigSubtabScript(): string {
     "    }",
     "  };",
 
-    // Update the disabled channel count shown in the toolbar toggle label.
+    // Update the disabled channel count shown in the toolbar toggle label. Uses a union selector to avoid double-counting rows that are both disabled and
+    // provider-unavailable.
     "  function updateDisabledCount() {",
     "    var countEl = document.getElementById('disabled-count');",
     "    if (!countEl) return;",
-    "    var disabledRows = document.querySelectorAll('tr.channel-disabled:not(.user-channel)');",
-    "    countEl.textContent = String(disabledRows.length);",
+    "    var hiddenRows = document.querySelectorAll('tr.channel-disabled:not(.user-channel), tr.channel-unavailable');",
+    "    countEl.textContent = String(hiddenRows.length);",
     "  };",
+
+    // Provider filter: toggle a provider tag on/off.
+    "  window.toggleProviderTag = function(checkbox) {",
+    "    var menu = checkbox.closest('.provider-dropdown-menu');",
+    "    if (!menu) return;",
+    "    var checkboxes = menu.querySelectorAll('input[type=\"checkbox\"]:not(:disabled)');",
+    "    var enabledTags = [];",
+    "    for (var i = 0; i < checkboxes.length; i++) {",
+    "      if (checkboxes[i].checked) enabledTags.push(checkboxes[i].getAttribute('data-tag'));",
+    "    }",
+
+    // If all checkboxes are checked, clear the filter (empty array = no filter).
+    "    var allCheckboxes = menu.querySelectorAll('input[type=\"checkbox\"]');",
+    "    var allChecked = true;",
+    "    for (var j = 0; j < allCheckboxes.length; j++) {",
+    "      if (!allCheckboxes[j].checked && !allCheckboxes[j].disabled) { allChecked = false; break; }",
+    "    }",
+    "    if (allChecked) enabledTags = [];",
+
+    // POST to server.
+    "    fetch('/config/provider-filter', {",
+    "      method: 'POST',",
+    "      headers: { 'Content-Type': 'application/json' },",
+    "      body: JSON.stringify({ enabledProviders: enabledTags })",
+    "    })",
+    "    .then(function(r) { return r.json(); })",
+    "    .then(function(result) {",
+    "      if (result.success) {",
+    "        updateProviderChips(enabledTags);",
+    "        filterChannelRows(enabledTags);",
+    "        updateBulkAssignOptions(enabledTags);",
+    "        updateProviderFilterButton(enabledTags);",
+    "        updateDisabledCount();",
+    "        showToast('Provider filter updated.' + PLAYLIST_HINT, 'success');",
+    "      }",
+    "    })",
+    "    .catch(function(err) { showToast('Failed to update filter: ' + err.message, 'error'); });",
+    "  };",
+
+    // Remove a provider chip (uncheck the tag and update).
+    "  window.removeProviderChip = function(tag) {",
+    "    var menu = document.querySelector('.provider-dropdown-menu');",
+    "    if (!menu) return;",
+    "    var cb = menu.querySelector('input[data-tag=\"' + tag + '\"]');",
+    "    if (cb) { cb.checked = false; toggleProviderTag(cb); }",
+    "  };",
+
+    // Update the provider filter button text.
+    "  function updateProviderFilterButton(enabledTags) {",
+    "    var btn = document.getElementById('provider-filter-btn');",
+    "    if (!btn) return;",
+    "    btn.innerHTML = (enabledTags.length > 0) ? 'Filtered &#9662;' : 'All Providers &#9662;';",
+    "  };",
+
+    // Rebuild the provider chips from the enabled tags.
+    "  function updateProviderChips(enabledTags) {",
+    "    var container = document.getElementById('provider-chips');",
+    "    if (!container) return;",
+    "    container.innerHTML = '';",
+    "    if (enabledTags.length === 0) return;",
+    "    var menu = document.querySelector('.provider-dropdown-menu');",
+    "    for (var i = 0; i < enabledTags.length; i++) {",
+    "      var tag = enabledTags[i];",
+    "      if (tag === 'direct') continue;",
+    "      var label = tag;",
+    "      if (menu) {",
+    "        var cb = menu.querySelector('input[data-tag=\"' + tag + '\"]');",
+    "        if (cb && cb.parentElement) label = cb.parentElement.textContent.trim();",
+    "      }",
+    "      var chip = document.createElement('span');",
+    "      chip.className = 'provider-chip';",
+    "      chip.setAttribute('data-tag', tag);",
+    "      chip.innerHTML = label + '<button type=\"button\" class=\"chip-close\" aria-label=\"Remove ' + label +",
+    "        '\" onclick=\"removeProviderChip(\\'' + tag + '\\')\">\\u00d7</button>';",
+    "      container.appendChild(chip);",
+    "    }",
+    "  };",
+
+    // Filter channel rows based on enabled provider tags. Toggles the channel-unavailable class on each row and updates Source column content. Filtered-out options
+    // are removed from the DOM entirely rather than hidden — Safari ignores both the hidden attribute and display:none on option elements because they are rendered by
+    // the OS native widget. All options (visible and removed) are stored in a _allOptions array on each select for reinsertion when the filter changes. Selection
+    // restore priority: (1) the saved choice (HTML selected attribute, kept in sync by updateProviderSelection), (2) the previous visual selection, (3) first option.
+    "  function filterChannelRows(enabledTags) {",
+    "    var rows = document.querySelectorAll('tr[data-provider-tags]');",
+    "    for (var i = 0; i < rows.length; i++) {",
+    "      var tags = rows[i].getAttribute('data-provider-tags').split(',');",
+    "      var available = true;",
+    "      if (enabledTags.length > 0) {",
+    "        available = false;",
+    "        for (var j = 0; j < tags.length; j++) {",
+    "          if (tags[j] === 'direct' || enabledTags.indexOf(tags[j]) !== -1) { available = true; break; }",
+    "        }",
+    "      }",
+    "      if (available) { rows[i].classList.remove('channel-unavailable'); }",
+    "      else { rows[i].classList.add('channel-unavailable'); }",
+
+    // Update Source column elements: toggle between the no-provider label and the provider content (select or static name).
+    "      var label = rows[i].querySelector('.no-provider-label');",
+    "      var sel = rows[i].querySelector('.provider-select');",
+    "      var name = rows[i].querySelector('.provider-name');",
+    "      if (label) label.style.display = available ? 'none' : '';",
+    "      if (name) name.style.display = available ? '' : 'none';",
+    "      if (sel) {",
+    "        sel.style.display = available ? '' : 'none';",
+
+    // On first call, snapshot all options (including server-hidden ones) into a persistent array.
+    "        if (!sel._allOptions) { sel._allOptions = Array.prototype.slice.call(sel.querySelectorAll('option')); }",
+    "        var prevValue = sel.value;",
+    "        sel.innerHTML = '';",
+    "        var serverDefault = null;",
+    "        var prevExists = false;",
+    "        for (var k = 0; k < sel._allOptions.length; k++) {",
+    "          var opt = sel._allOptions[k];",
+    "          var oTag = opt.getAttribute('data-provider-tag');",
+    "          var show = (enabledTags.length === 0) || oTag === 'direct' || enabledTags.indexOf(oTag) !== -1;",
+    "          if (show) {",
+    "            sel.appendChild(opt);",
+    "            if (opt.hasAttribute('selected')) serverDefault = opt;",
+    "            if (opt.value === prevValue) prevExists = true;",
+    "          }",
+    "        }",
+    "        if (serverDefault) { sel.value = serverDefault.value; }",
+    "        else if (prevExists) { sel.value = prevValue; }",
+    "        else if (sel.options.length > 0) { sel.selectedIndex = 0; }",
+    "      }",
+    "    }",
+    "  };",
+
+    // Re-run the provider filter on all channel rows using the current checkbox state. Called after insertChannelRow replaces a row (which loses the filter state).
+    "  function refilterChannelRows() {",
+    "    var menu = document.querySelector('.provider-dropdown-menu');",
+    "    if (!menu) return;",
+    "    var cbs = menu.querySelectorAll('input[type=\"checkbox\"]:not(:disabled)');",
+    "    var enabledTags = [];",
+    "    var allChecked = true;",
+    "    for (var i = 0; i < cbs.length; i++) {",
+    "      if (cbs[i].checked) { enabledTags.push(cbs[i].getAttribute('data-tag')); }",
+    "      else { allChecked = false; }",
+    "    }",
+    "    if (allChecked) { enabledTags = []; }",
+    "    if (enabledTags.length > 0) { filterChannelRows(enabledTags); }",
+    "  }",
+
+    // Update bulk assign dropdown to only show enabled providers. Uses DOM removal like filterChannelRows because Safari ignores hidden/display:none on option
+    // elements. The snapshot filters by truthy .value to exclude the "Choose provider..." placeholder (value="") so it is never removed from the DOM.
+    "  function updateBulkAssignOptions(enabledTags) {",
+    "    var select = document.getElementById('bulk-assign');",
+    "    if (!select) return;",
+    "    if (!select._allOptions) {",
+    "      select._allOptions = [];",
+    "      var all = select.querySelectorAll('option');",
+    "      for (var a = 0; a < all.length; a++) { if (all[a].value) select._allOptions.push(all[a]); }",
+    "    }",
+    "    for (var i = 0; i < select._allOptions.length; i++) {",
+    "      var opt = select._allOptions[i];",
+    "      if (opt.parentNode === select) { select.removeChild(opt); }",
+    "    }",
+    "    for (var j = 0; j < select._allOptions.length; j++) {",
+    "      var opt2 = select._allOptions[j];",
+    "      if (enabledTags.length === 0 || opt2.value === 'direct' || enabledTags.indexOf(opt2.value) !== -1) {",
+    "        select.appendChild(opt2);",
+    "      }",
+    "    }",
+    "    select.value = '';",
+    "  };",
+
+    // Bulk assign all channels to a specific provider. Updates all dropdowns and profile cells in-place.
+    "  window.bulkAssignProvider = function(selectEl) {",
+    "    var providerTag = selectEl.value;",
+    "    if (!providerTag) return;",
+    "    selectEl.value = '';",
+    "    fetch('/config/provider-bulk-assign', {",
+    "      method: 'POST',",
+    "      headers: { 'Content-Type': 'application/json' },",
+    "      body: JSON.stringify({ provider: providerTag })",
+    "    })",
+    "    .then(function(r) { return r.json(); })",
+    "    .then(function(result) {",
+    "      if (result.success) {",
+    "        var msg = result.affected + ' of ' + result.total + ' channel(s) updated.';",
+    "        var undoAction = null;",
+    "        if (result.affected > 0 && result.previousSelections) {",
+    "          var prevSelections = result.previousSelections;",
+    "          undoAction = { label: 'Undo', onclick: function() { restoreBulkProviders(prevSelections); } };",
+    "        }",
+    "        showToast(msg, 'success', undoAction ? 10000 : undefined, undoAction);",
+    "        if (result.selections) {",
+    "          for (var key in result.selections) {",
+    "            var sel = result.selections[key];",
+    "            updateChannelProviderUI(key, sel.variant);",
+    "          }",
+    "        }",
+    "      } else {",
+    "        showToast(result.error || 'Failed to assign.', 'error');",
+    "      }",
+    "    })",
+    "    .catch(function(err) { showToast('Failed to assign: ' + err.message, 'error'); });",
+    "  };",
+
+    // Restore previous provider selections (undo bulk assign). Sends the previousSelections map to the server and updates the UI with the restored selections.
+    "  function restoreBulkProviders(prevSelections) {",
+    "    fetch('/config/provider-bulk-restore', {",
+    "      method: 'POST',",
+    "      headers: { 'Content-Type': 'application/json' },",
+    "      body: JSON.stringify({ selections: prevSelections })",
+    "    })",
+    "    .then(function(r) { return r.json(); })",
+    "    .then(function(result) {",
+    "      if (result.success) {",
+    "        showToast('Bulk assign reverted.', 'success');",
+    "        if (result.selections) {",
+    "          for (var key in result.selections) {",
+    "            var sel = result.selections[key];",
+    "            updateChannelProviderUI(key, sel.variant);",
+    "          }",
+    "        }",
+    "      } else {",
+    "        showToast(result.error || 'Failed to revert.', 'error');",
+    "      }",
+    "    })",
+    "    .catch(function(err) { showToast('Failed to revert: ' + err.message, 'error'); });",
+    "  }",
 
     // Close all open dropdown menus.
     "  function closeDropdowns() {",
@@ -1947,6 +2775,27 @@ function generateConfigSubtabScript(): string {
     "  document.addEventListener('click', function(e) {",
     "    if (!e.target.closest('.dropdown')) closeDropdowns();",
     "  });",
+
+    // Copy a stream URL to the clipboard and show a toast notification. The type parameter selects HLS or MPEG-TS format. Uses the modern Clipboard API when
+    // available (secure contexts), falling back to execCommand for plain HTTP access via IP address.
+    "  window.copyStreamUrl = function(type, key) {",
+    "    closeDropdowns();",
+    "    var url = (type === 'hls') ? (location.origin + '/hls/' + key + '/stream.m3u8') : (location.origin + '/stream/' + key);",
+    "    if (navigator.clipboard && navigator.clipboard.writeText) {",
+    "      navigator.clipboard.writeText(url).then(function() { showToast('Stream URL copied to clipboard.', 'success'); })",
+    "        .catch(function() { showToast('Failed to copy URL.', 'error'); });",
+    "    } else {",
+    "      var ta = document.createElement('textarea');",
+    "      ta.value = url;",
+    "      ta.style.position = 'fixed';",
+    "      ta.style.opacity = '0';",
+    "      document.body.appendChild(ta);",
+    "      ta.select();",
+    "      try { document.execCommand('copy'); showToast('Stream URL copied to clipboard.', 'success'); }",
+    "      catch(e) { showToast('Failed to copy URL.', 'error'); }",
+    "      document.body.removeChild(ta);",
+    "    }",
+    "  };",
 
     // Toggle visibility of disabled predefined channels and persist preference.
     "  window.toggleDisabledVisibility = function() {",
@@ -1982,13 +2831,34 @@ function generateConfigSubtabScript(): string {
     "    } catch (e) {}",
     "  };",
 
-    // Initialize disabled channel toggle and URL input listeners on page load.
+    // Initialize disabled channel toggle, provider filter, URL input listeners, and pending toast on page load.
     "  (function() {",
+
+    // Show any toast queued by showToastAfterReload() before the last page reload.
+    "    var pending = sessionStorage.getItem('pendingToast');",
+    "    if (pending) {",
+    "      sessionStorage.removeItem('pendingToast');",
+    "      try { var pt = JSON.parse(pending); showToast(pt.message, pt.type); } catch (e) {}",
+    "    }",
     "    if (localStorage.getItem('prismcast-show-disabled-channels') === 'true') {",
     "      var table = document.querySelector('.channel-table');",
     "      var checkbox = document.getElementById('show-disabled-toggle');",
     "      if (table) table.classList.remove('hide-disabled');",
     "      if (checkbox) checkbox.checked = true;",
+    "    }",
+
+    // Run filterChannelRows on page load when a provider filter is active. The server renders filtered options with the hidden attribute, but Safari ignores it on
+    // option elements. This initial pass removes those options from the DOM to enforce the filter.
+    "    var menu = document.querySelector('.provider-dropdown-menu');",
+    "    if (menu) {",
+    "      var cbs = menu.querySelectorAll('input[type=\"checkbox\"]:not(:disabled)');",
+    "      var tags = [];",
+    "      var allChecked = true;",
+    "      for (var ci = 0; ci < cbs.length; ci++) {",
+    "        if (cbs[ci].checked) { tags.push(cbs[ci].getAttribute('data-tag')); }",
+    "        else { allChecked = false; }",
+    "      }",
+    "      if (!allChecked) { filterChannelRows(tags); updateBulkAssignOptions(tags); }",
     "    }",
     "    var addUrlInput = document.getElementById('add-url');",
     "    if (addUrlInput) {",
@@ -2002,7 +2872,6 @@ function generateConfigSubtabScript(): string {
 
     // Start login mode for a channel. Opens browser window and shows modal.
     "  window.startChannelLogin = function(channel) {",
-    "    showStatus('Starting login...', 'info');",
     "    fetch('/auth/login', {",
     "      method: 'POST',",
     "      headers: { 'Content-Type': 'application/json' },",
@@ -2011,14 +2880,14 @@ function generateConfigSubtabScript(): string {
     "    .then(function(response) { return response.json(); })",
     "    .then(function(result) {",
     "      if (result.success) {",
-    "        showStatus('Browser window opened. Complete authentication.', 'info');",
+    "        showToast('Browser window opened. Complete authentication.', 'info');",
     "        showLoginModal();",
     "        startLoginStatusPolling();",
     "      } else {",
-    "        showStatus(result.error || 'Failed to start login.', 'error');",
+    "        showToast(result.error || 'Failed to start login.', 'error');",
     "      }",
     "    })",
-    "    .catch(function(err) { showStatus('Failed to start login: ' + err.message, 'error'); });",
+    "    .catch(function(err) { showToast('Failed to start login: ' + err.message, 'error'); });",
     "  };",
 
     // End login mode. Closes browser tab and hides modal.
@@ -2027,9 +2896,9 @@ function generateConfigSubtabScript(): string {
     "    fetch('/auth/done', { method: 'POST' })",
     "    .then(function() {",
     "      hideLoginModal();",
-    "      showStatus('Authentication complete.', 'success');",
+    "      showToast('Authentication complete.', 'success');",
     "    })",
-    "    .catch(function(err) { showStatus('Error ending login: ' + err.message, 'error'); hideLoginModal(); });",
+    "    .catch(function(err) { showToast('Error ending login: ' + err.message, 'error'); hideLoginModal(); });",
     "  };",
 
     // Show the login modal.
@@ -2054,7 +2923,7 @@ function generateConfigSubtabScript(): string {
     "        if (!status.active) {",
     "          stopLoginStatusPolling();",
     "          hideLoginModal();",
-    "          showStatus('Login session ended.', 'info');",
+    "          showToast('Login session ended.', 'info');",
     "        }",
     "      })",
     "      .catch(function() { });",
@@ -2132,6 +3001,16 @@ function generateLandingPageStyles(): string {
     ".header-status { display: flex; gap: 20px; align-items: center; font-size: 13px; color: var(--text-secondary); }",
     ".header-status span { white-space: nowrap; }",
 
+    // Stream count popover. Clickable when streams are active; popover drops from the right edge of the header.
+    "#stream-count { background: none; border: none; color: inherit; font: inherit; padding: 0; }",
+    "#stream-count.clickable { cursor: pointer; }",
+    "#stream-count.clickable:hover { color: var(--text-primary); }",
+    ".stream-popover .dropdown-menu { right: 0; left: auto; min-width: 220px; }",
+    ".stream-popover-row { display: flex; align-items: center; gap: 8px; padding: 6px 12px; font-size: 13px; white-space: nowrap; }",
+    ".stream-popover-logo { height: 18px; width: auto; max-width: 80px; vertical-align: middle; }",
+    ".stream-popover-channel { color: var(--text-primary); }",
+    ".stream-popover-duration { color: var(--text-muted); margin-left: auto; }",
+
     // Subtab styles for Configuration tab.
     ".subtab-bar { display: flex; border-bottom: 1px solid var(--border-default); margin-bottom: 20px; gap: 2px; flex-wrap: wrap; }",
     ".subtab-btn { padding: 8px 16px; border: none; background: var(--subtab-bg); cursor: pointer; font-size: 13px; font-weight: 500; ",
@@ -2189,24 +3068,29 @@ function generateLandingPageStyles(): string {
     ".log-entry { color: var(--dark-text-secondary); }",
     ".log-error { color: var(--dark-text-error); }",
     ".log-warn { color: var(--dark-text-warn); }",
+    ".log-debug { color: var(--dark-text-debug); }",
     ".log-muted { color: var(--dark-text-muted); }",
     ".log-connecting { color: var(--dark-text-muted); }",
 
-    // Channel table styles. The wrapper enables horizontal scrolling on small screens.
-    ".channel-table-wrapper { overflow-x: auto; margin-bottom: 20px; }",
-    ".channel-table { width: 100%; border-collapse: collapse; table-layout: fixed; min-width: 700px; }",
-    ".channel-table th, .channel-table td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border-default); ",
-    "overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
-    ".channel-table th { background: var(--table-header-bg); font-weight: 600; font-size: 13px; }",
+    // Channel table styles. The wrapper provides a rounded card border and enables horizontal scrolling on small screens. We use border-collapse: separate so
+    // that border-radius works on the header cells.
+    // Max-width caps the Name column (the sole flexible column) at 350px. Fixed columns: Key 170 + Provider 200 + Actions 140 = 510px.
+    ".channel-table-wrapper { max-width: 860px; margin: 0 auto 20px; border: 1px solid var(--border-default); border-radius: var(--radius-lg); overflow: auto; }",
+    ".channel-table { width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed; min-width: 650px; margin: 0; }",
+    ".channel-table th, .channel-table td { padding: 10px 12px; text-align: left; border: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
+    ".channel-table th { background: var(--table-header-bg); font-weight: 600; font-size: 13px; border-bottom: 1px solid var(--border-default); }",
+    ".channel-table tbody tr:nth-child(even):not(.user-channel) { background: var(--table-row-even); }",
     ".channel-table tr:hover { background: var(--table-row-hover); }",
     ".channel-table .col-key { width: 170px; }",
-    ".channel-table .col-name { width: 220px; }",
-    ".channel-table .col-profile { width: 140px; }",
-    ".channel-table .col-actions { width: 170px; white-space: nowrap; overflow: visible; }",
-    ".channel-url { font-size: 12px; color: var(--text-secondary); }",
+    ".channel-table .col-provider { width: 200px; }",
+    ".channel-table .col-actions, .channel-table td:last-child { width: 140px; white-space: nowrap; overflow: visible; }",
+    ".provider-select { width: 100%; padding: 2px 4px; font-size: 12px; border: 1px solid var(--form-input-border); ",
+    "border-radius: 3px; background: var(--form-input-bg); color: var(--text-primary); }",
 
-    // Responsive: hide Profile on tablets, hide Key and Profile on phones.
-    "@media (max-width: 1024px) { .channel-table .col-profile, .channel-table td:nth-child(4), .channel-table th:nth-child(4) { display: none; } }",
+    // Key column styling: monospace at a slightly smaller size with secondary color to reduce visual weight.
+    ".ch-key { color: var(--text-secondary); font-family: var(--font-mono); font-size: 13px; }",
+
+    // Responsive: hide Key on phones.
     "@media (max-width: 768px) { .channel-table .col-key, .channel-table td:nth-child(1), .channel-table th:nth-child(1) { display: none; } }",
 
     // User channel row tinting to distinguish custom/override channels from predefined.
@@ -2216,17 +3100,69 @@ function generateLandingPageStyles(): string {
     // Disabled predefined channel row styling and hide-disabled toggle.
     ".channel-table tr.channel-disabled { opacity: 0.5; }",
     ".channel-table tr.channel-disabled td { color: var(--text-tertiary); }",
-    ".channel-table tr.channel-disabled code { color: var(--text-tertiary); }",
     ".channel-table.hide-disabled tr.channel-disabled { display: none; }",
 
-    // Enable/Disable button styling.
-    ".btn-enable { background: var(--status-success-bg); color: var(--status-success-text); border: 1px solid var(--status-success-border); }",
-    ".btn-enable:hover { background: var(--status-success-border); }",
-    ".btn-disable { background: var(--surface-elevated); color: var(--text-secondary); border: 1px solid var(--border-default); }",
-    ".btn-disable:hover { border-color: var(--text-secondary); }",
+    // Provider-filtered channel row styling. Uses reduced opacity and italic text to distinguish from manually disabled rows. The compound selector ensures that rows
+    // which are both disabled and provider-filtered render at the disabled-level opacity (0.5) rather than the more aggressive unavailable-level opacity (0.4).
+    ".channel-table tr.channel-unavailable { opacity: 0.4; font-style: italic; }",
+    ".channel-table tr.channel-unavailable td { color: var(--text-tertiary); }",
+    ".channel-table tr.channel-unavailable.channel-disabled { opacity: 0.5; }",
+    ".channel-table.hide-disabled tr.channel-unavailable { display: none; }",
+    ".no-provider-label { color: var(--text-tertiary); font-size: 12px; }",
+
+    // Provider filter toolbar layout.
+    ".provider-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; }",
+    ".provider-toolbar .toolbar-group { display: flex; align-items: center; gap: 6px; }",
+    ".provider-toolbar .toolbar-label { font-size: 13px; color: var(--text-secondary); white-space: nowrap; }",
+    ".provider-toolbar .toolbar-spacer { flex: 1; }",
+
+    // Provider dropdown multi-select.
+    ".provider-dropdown-menu { min-width: 200px; max-height: 300px; overflow-y: auto; }",
+    ".provider-option { display: flex; align-items: center; gap: 6px; padding: 5px 12px; font-size: 13px; cursor: pointer; color: var(--text-primary); }",
+    ".provider-option:hover { background: var(--surface-sunken); }",
+    ".provider-option input[type=\"checkbox\"] { margin: 0; }",
+
+    // Provider chips.
+    ".provider-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }",
+    ".provider-chip { display: inline-flex; align-items: center; gap: 4px; background: var(--surface-elevated); border: 1px solid var(--border-default); ",
+    "border-radius: 12px; padding: 2px 8px 2px 10px; font-size: 12px; color: var(--text-secondary); min-height: 24px; }",
+    ".chip-close { background: none; border: none; cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px; color: var(--text-muted); ",
+    "transition: color 0.2s; }",
+    ".chip-close:hover { color: var(--text-primary); }",
+
+    // Bulk assign dropdown.
+    ".bulk-assign-select { font-size: 13px; padding: 4px 8px; border: 1px solid var(--border-default); border-radius: var(--radius-md); ",
+    "background: var(--surface-page); color: var(--text-primary); cursor: pointer; }",
+
+    // Responsive: stack provider toolbar groups vertically on small screens.
+    "@media (max-width: 768px) { .provider-toolbar { flex-direction: column; align-items: flex-start; } }",
+
+    // Icon button styling for channel action buttons.
+    ".btn-icon { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: none; ",
+    "border-radius: var(--radius-md); background: transparent; cursor: pointer; color: var(--text-secondary); transition: color 0.15s, background 0.15s; }",
+    ".btn-icon:hover { background: var(--surface-hover); }",
+    ".user-channel .btn-icon:hover { background: var(--user-channel-tint-hover); }",
+    ".btn-icon-edit:hover { color: var(--interactive-edit); }",
+    ".btn-icon-delete:hover { color: var(--interactive-delete); }",
+    ".btn-icon-revert:hover { color: var(--interactive-edit); }",
+    ".btn-icon-enable:hover { color: var(--interactive-success); }",
+    ".btn-icon-disable:hover { color: var(--interactive-delete); }",
+    ".btn-icon-login:hover { color: var(--interactive-primary); }",
+    ".btn-icon-copy:hover { color: var(--interactive-primary); }",
+    ".btn-icon-placeholder { display: inline-block; width: 28px; height: 28px; }",
+    ".copy-dropdown .dropdown-menu { left: auto; right: 0; }",
+    ".copy-dropdown .dropdown-item { font-size: 12px; }",
+
+    // JS tooltip styling. The tooltip element is appended to <body> and positioned via getBoundingClientRect() so it's immune to overflow and stacking contexts.
+    // Only activated when the primary input can't hover (hover: none), targeting iPadOS where Safari doesn't show native title tooltips. On pure-touch
+    // devices without a trackpad, the JS loads but mouseenter never fires so the tooltip stays hidden. Desktop (hover: hover) skips initialization entirely.
+    ".btn-icon-tooltip { position: fixed; padding: 4px 8px; border-radius: var(--radius-sm); background: var(--surface-overlay); color: var(--text-primary); ",
+    "font-size: 12px; white-space: nowrap; pointer-events: none; opacity: 0; transition: opacity 0.5s; z-index: 10000; ",
+    "box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15); }",
+    ".btn-icon-tooltip.visible { opacity: 1; transition: opacity 0.1s; }",
 
     // Channel toolbar with operation buttons and display controls.
-    ".channel-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 15px; }",
+    ".channel-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; margin-bottom: 15px; }",
     ".channel-toolbar .toolbar-group { display: flex; align-items: center; gap: 6px; }",
     ".channel-toolbar .toolbar-spacer { flex: 1; }",
     ".channel-toolbar .toggle-label { font-size: 12px; color: var(--text-secondary); cursor: pointer; display: flex; align-items: center; gap: 4px; ",
@@ -2261,7 +3197,7 @@ function generateLandingPageStyles(): string {
     "padding: 20px; }",
     ".profile-reference-header { display: flex; justify-content: space-between; align-items: flex-start; }",
     ".profile-reference h3 { margin: 0 0 10px 0; color: var(--text-heading-secondary); }",
-    ".profile-reference-close { color: var(--text-secondary); font-size: 18px; text-decoration: none; padding: 0 5px; }",
+    ".profile-reference-close { color: var(--text-secondary); font-size: 18px; background: none; border: none; cursor: pointer; padding: 0 5px; }",
     ".profile-reference-close:hover { color: var(--text-primary); }",
     ".reference-intro { color: var(--text-secondary); font-size: 13px; margin-bottom: 20px; }",
     ".profile-category { margin-bottom: 20px; }",
@@ -2272,6 +3208,16 @@ function generateLandingPageStyles(): string {
     ".profile-list dt { font-family: var(--font-mono); font-size: 13px; font-weight: 600; margin-top: 10px; color: var(--text-primary); }",
     ".profile-list dt:first-child { margin-top: 0; }",
     ".profile-list dd { color: var(--text-secondary); font-size: 13px; margin: 4px 0 0 0; }",
+    ".selector-guide-heading { margin-top: 20px !important; border-top: 1px solid var(--border-default); padding-top: 16px; }",
+
+    // API Reference index.
+    ".api-index { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px 24px; margin-top: 12px; }",
+    ".api-index-group { display: flex; flex-direction: column; gap: 2px; }",
+    ".api-index a { color: var(--text-secondary); text-decoration: none; font-size: 12px; line-height: 1.5; }",
+    ".api-index a:hover { color: var(--interactive-primary); }",
+    ".api-index a code { font-size: 11px; }",
+    ".api-index-heading { font-weight: 600; font-size: 13px !important; color: var(--text-primary) !important; margin-bottom: 1px; }",
+    ".api-index-desc { color: var(--text-muted); font-size: 11px; margin-bottom: 3px; }",
 
     // Other landing page styles.
     ".endpoint code { font-size: 13px; }",
@@ -2326,12 +3272,36 @@ function generateLandingPageStyles(): string {
     "font-size: 14px; cursor: pointer; transition: all 0.15s ease; }",
     ".btn-danger:hover { opacity: 0.9; }",
 
-    // Status message styling for AJAX feedback. Includes transition for smooth fade-out on auto-dismiss.
-    ".config-status { padding: 15px; border-radius: var(--radius-lg); margin-bottom: 20px; transition: opacity 0.3s ease; }",
-    ".config-status.success { background: var(--status-success-bg); border: 1px solid var(--status-success-border); color: var(--status-success-text); }",
-    ".config-status.error { background: var(--status-error-bg); border: 1px solid var(--status-error-border); color: var(--status-error-text); }",
-    ".config-status.info { background: var(--status-info-bg, #e0f2fe); border: 1px solid var(--status-info-border, #7dd3fc); ",
-    "color: var(--status-info-text, #0369a1); }",
+    // Toast notification container: fixed top-right, above all modals.
+    ".toast-container { position: fixed; top: 20px; right: 20px; z-index: 1001; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }",
+
+    // Individual toast: themed colors, slide-in animation, close button.
+    ".toast { padding: 12px 36px 12px 16px; border-radius: var(--radius-md); box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15); min-width: 280px; max-width: 420px; ",
+    "font-size: 13px; line-height: 1.4; white-space: pre-line; position: relative; pointer-events: auto; animation: toastIn 0.3s ease-out; }",
+    ".toast.toast-exit { animation: toastOut 0.3s ease-in forwards; }",
+
+    // Type variants using existing theme status variables.
+    ".toast.success { background: var(--status-success-bg); border: 1px solid var(--status-success-border); color: var(--status-success-text); }",
+    ".toast.error { background: var(--status-error-bg); border: 1px solid var(--status-error-border); color: var(--status-error-text); }",
+    ".toast.warning { background: var(--status-warning-bg); border: 1px solid var(--status-warning-border); color: var(--status-warning-text); }",
+    ".toast.info { background: var(--status-info-bg); border: 1px solid var(--status-info-border); color: var(--status-info-text); }",
+
+    // Close button positioned top-right within each toast.
+    ".toast-close { position: absolute; top: 8px; right: 8px; background: none; border: none; cursor: pointer; font-size: 16px; line-height: 1; padding: 0 4px; ",
+    "color: inherit; opacity: 0.6; }",
+    ".toast-close:hover { opacity: 1; }",
+
+    // Action button for toasts with an undo or similar inline action.
+    ".toast-action { display: inline-block; margin-left: 8px; padding: 2px 10px; border: 1px solid currentColor; border-radius: var(--radius-sm); ",
+    "background: none; color: inherit; cursor: pointer; font-size: 12px; font-weight: 600; opacity: 0.8; vertical-align: baseline; }",
+    ".toast-action:hover { opacity: 1; background: rgba(0, 0, 0, 0.1); }",
+
+    // Toast slide animations.
+    "@keyframes toastIn { from { transform: translateX(120%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }",
+    "@keyframes toastOut { from { transform: translateX(0); opacity: 1; } to { transform: translateX(120%); opacity: 0; } }",
+
+    // Responsive: full-width toasts on narrow screens.
+    "@media (max-width: 768px) { .toast-container { left: 20px; right: 20px; } .toast { min-width: 0; max-width: none; } }",
 
     // Loading state for buttons.
     ".btn.loading { opacity: 0.7; pointer-events: none; }",
@@ -2424,23 +3394,13 @@ export function setupRootEndpoint(app: Express): void {
 
     const baseUrl = resolveBaseUrl(req);
 
-    // Count the number of video channels (excluding static pages).
-    const channels = getAllChannels();
-
-    const videoChannelCount = Object.keys(channels).filter((name) => {
-
-      const channel = channels[name];
-      const profile = resolveProfile(channel.profile);
-
-      return !profile.noVideo;
-    }).length;
-
     // Generate content for each tab.
-    const overviewContent = generateOverviewContent(baseUrl, videoChannelCount);
+    const overviewContent = generateOverviewContent(baseUrl);
     const channelsContent = generateChannelsTabContent();
     const logsContent = generateLogsContent();
     const configContent = generateConfigContent();
     const apiContent = generateApiReferenceContent();
+    const helpContent = generateHelpContent();
 
     // Build the tab bar.
     const tabBar = [
@@ -2450,6 +3410,7 @@ export function setupRootEndpoint(app: Express): void {
       generateTabButton("logs", "Logs", false),
       generateTabButton("config", "Configuration", false),
       generateTabButton("api", "API Reference", false),
+      generateTabButton("help", "Help", false),
       "</div>"
     ].join("\n");
 
@@ -2459,7 +3420,8 @@ export function setupRootEndpoint(app: Express): void {
       generateTabPanel("channels", channelsContent, false),
       generateTabPanel("logs", logsContent, false),
       generateTabPanel("config", configContent, false),
-      generateTabPanel("api", apiContent, false)
+      generateTabPanel("api", apiContent, false),
+      generateTabPanel("help", helpContent, false)
     ].join("\n");
 
     // Build the page header with logo, title, version, links, and status bar.
@@ -2499,7 +3461,8 @@ export function setupRootEndpoint(app: Express): void {
 
     // Build the body content.
     const changelogModal = generateChangelogModal();
-    const bodyContent = [ header, tabBar, tabPanels, restartModal, changelogModal ].join("\n");
+    const bodyContent = [ header, tabBar, tabPanels, restartModal, changelogModal,
+      "<div id=\"toast-container\" class=\"toast-container\"></div>" ].join("\n");
 
     // Generate scripts: tab switching, config subtab handling, then status SSE for header updates.
     const scripts = [

@@ -12,10 +12,7 @@ import type { StreamHealthStatus } from "../streaming/statusEmitter.js";
 import { emitCurrentSystemStatus } from "../browser/index.js";
 import { terminateStream } from "../streaming/lifecycle.js";
 
-/*
- * STREAM MANAGEMENT
- *
- * The streams endpoint provides visibility into active streams and allows operators to terminate streams via the API. This is useful for debugging and for
+/* The streams endpoint provides visibility into active streams and allows operators to terminate streams via the API. This is useful for debugging and for
  * integrations that need to manage stream lifecycle.
  */
 
@@ -103,10 +100,7 @@ export function setupStreamsEndpoint(app: Express): void {
     res.json({ message: "Stream terminated.", streamId: streamIdParam });
   });
 
-  /*
-   * SSE STATUS STREAM ENDPOINT
-   *
-   * The /streams/status endpoint provides real-time stream and system status via Server-Sent Events. Connected clients receive an initial snapshot of all streams
+  /* The /streams/status endpoint provides real-time stream and system status via Server-Sent Events. Connected clients receive an initial snapshot of all streams
    * and the system state, then receive updates as streams are added, removed, or their health changes.
    */
 
@@ -133,10 +127,10 @@ export function setupStreamsEndpoint(app: Express): void {
       res.write("data: " + JSON.stringify(data) + "\n\n");
     });
 
-    // Send a heartbeat comment every 30 seconds to keep the connection alive through proxies.
+    // Send a named heartbeat event every 30 seconds to keep the connection alive through proxies and allow clients to detect staleness.
     const heartbeatInterval = setInterval(() => {
 
-      res.write(": heartbeat\n\n");
+      res.write("event: heartbeat\ndata: \n\n");
     }, 30000);
 
     // Clean up when the client disconnects.
