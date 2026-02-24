@@ -50,7 +50,7 @@ const NATIVE_FMP4_MIME_TYPE = "video/mp4;codecs=avc1,mp4a.40.2";
 
 // WebM+FFmpeg capture uses WebM/H264+Opus, which requires FFmpeg to transcode audio to AAC. This mode is more stable for long recordings because Chrome's native fMP4
 // MediaRecorder can become unstable after 20-30 minutes.
-const WEBM_FFMPEG_MIME_TYPE = "video/webm;codecs=h264,opus";
+const WEBM_FFMPEG_MIME_TYPE = "video/x-matroska;codecs=hvc1.1.6.L120.90";
 
 // Capture initialization queue. Chrome's tabCapture extension can only initialize one capture at a time — concurrent getStream() calls fail with "Cannot capture a
 // tab with an active stream." We serialize capture initialization using a promise chain so requests execute sequentially. Once a capture is established, it runs
